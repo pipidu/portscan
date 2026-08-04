@@ -2,3 +2,13 @@
 *.exe
 *.pdb
 /.reasonix
+
+# 防御性规则：敏感与临时文件（当前无此类文件，防止未来误提交）
+.env
+*.pem
+*.key
+*.log
+.idea/
+.vscode/
+/results/
+/exports/
