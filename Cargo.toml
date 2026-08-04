@@ -1,0 +1,32 @@
+[package]
+name = "portscan"
+version = "0.1.0"
+edition = "2021"
+description = "内网 TCP 端口扫描工具（默认扫描全部端口 1-65535）"
+
+[dependencies]
+anyhow = "1.0"
+cidr = "0.3"
+clap = { version = "4.6", features = ["derive"] }
+csv = "1.4"
+eframe = "0.35.0"
+egui_extras = "0.35"
+rfd = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+
+[lib]
+name = "portscan"
+path = "src/lib.rs"
+
+[[bin]]
+name = "portscan"
+path = "src/main.rs"
+
+[[bin]]
+name = "portscan-gui"
+path = "src/bin/gui.rs"
+
+[profile.release]
+opt-level = 3
