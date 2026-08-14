@@ -96,10 +96,31 @@ portscan 192.168.1.0/24 --quiet --csv result.csv --json result.json
 
 ```
 127.0.0.1 开放端口 (2):
-  80/tcp   (http)
-  445/tcp  (microsoft-ds)
+  80/tcp   (http) 2/0/14ms
+  445/tcp  (microsoft-ds) 2/15/0ms
 扫描完成: 65535 个探测点, 耗时 10.03s, 共发现 46 个开放端口
 ```
+
+端口行格式：`端口/协议 (服务) 延迟1/延迟2/延迟3ms [状态]`——延迟为 3 次测量（失败显示 `-`，如 `101/-/105`）；可疑端口带 `[可疑]` 标记，UDP 无响应带 `[open|filtered]`。
+
+### 导出报告
+
+四种格式头部均含本次扫描总情况（目标/端口/协议/探测点/耗时/开放·可疑·开放|过滤计数）：
+
+```
+# portscan 扫描报告          （CSV 为 # 注释行；TXT/HTML 为头部区块）
+# 目标: 192.168.1.0/24
+# 端口: 1-65535
+# 协议: tcp
+# 探测点: 65535
+# 耗时: 12.34s
+# 结果: 开放 46 · 可疑 1 · 开放|过滤 0
+```
+
+- **CSV**：表头 `ip,port,proto,service,latency_ms,state` + 数据行
+- **JSON**：`targets/ports/proto/total_probes/duration_ms/三计数/open_ports`
+- **TXT**：文本报告，按 IP 分组列出端口、服务、延迟与状态
+- **HTML**：白底网页报告，含结果分布条（绿=open/橙=可疑/黄=open|filtered/红=其他），可直接浏览器打开
 
 ## 测试
 
@@ -107,7 +128,7 @@ portscan 192.168.1.0/24 --quiet --csv result.csv --json result.json
 cargo test --release
 ```
 
-34 个单元测试覆盖：扫描核心（并发/串行/超时/进度/UDP 探测/劫持检测/延迟三测）、目标解析（IP/域名/CIDR/主机地址形式/上限）、端口解析（范围/服务名/UDP 分表/常用端口）、报告生成（TXT/HTML/JSON/CSV 头部/HTML 转义）。
+34 个单元测试覆盖：扫描核心（并发/串行/超时/进度/UDP 探测/劫持检测/延迟三测）、目标解析（IP/域名/CIDR/主机地址形式/上限）、端口解析（范围/服务名/UDP 分表/常用端口）、报告生成（TXT/HTML/JSON/CSV 头部/HTML 转义/延迟占位显示）。
 
 ## 技术栈
 
