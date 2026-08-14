@@ -66,7 +66,6 @@ portscan "192.168.1.0/24, 10.0.0.5, router.local"
 
 # 导出四种格式报告（头部含扫描总情况）
 portscan 192.168.1.0/24 --csv result.csv --json result.json --txt report.txt --html report.html
-```
 
 # 调整并发与超时（毫秒）
 portscan 192.168.1.0/24 -c 2048 -t 500
