@@ -5,17 +5,56 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::net::TcpStream;
+use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
+
+/// 扫描协议
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Proto {
+    Tcp,
+    Udp,
+    /// TCP 与 UDP 同时扫描
+    Both,
+}
+
+impl Proto {
+    pub fn name(self) -> &'static str {
+        match self {
+            Proto::Tcp => "tcp",
+            Proto::Udp => "udp",
+            Proto::Both => "tcp+udp",
+        }
+    }
+}
+
+/// 单个探测点的结果状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeState {
+    /// 确认开放（TCP 连接成功 / UDP 收到响应）
+    Open,
+    /// 无响应（UDP 超时，可能是开放或被防火墙过滤）
+    Filtered,
+    /// 确认关闭（TCP 拒绝 / UDP 收到 ICMP 不可达）
+    Closed,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OpenPort {
     pub ip: IpAddr,
     pub port: u16,
+    /// 协议："tcp" 或 "udp"
+    pub proto: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service: Option<&'static str>,
+    /// true = UDP 无响应，状态为 open|filtered
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub filtered: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 pub struct ScanConfig {
@@ -42,9 +81,12 @@ impl Drop for CancelGuard {
     }
 }
 
-/// 对全部 (ip, port) 组合执行 TCP connect 扫描。
+/// 对全部 (ip, port) 组合执行端口扫描（TCP connect 或 UDP 探测）。
 /// 任务分批 spawn（每批至多 `batch_size` 个），内存占用与并发数成正比而非与总探测点数成正比；
-/// 信号量限制同时进行的连接数。空输入直接返回空结果。
+/// 信号量限制同时进行的探测数。空输入直接返回空结果。
+///
+/// UDP 探测：发送探测包后等待响应或 ICMP 不可达——有响应判 open，
+/// 收到 ICMP 不可达判 closed，超时无响应判 open|filtered（OpenPort.filtered = true）。
 ///
 /// `quiet` 为 true 时不向 stderr 输出进度；
 /// `progress` 提供时，进度通过 watch channel 实时更新；
@@ -57,6 +99,7 @@ pub async fn scan(
     quiet: bool,
     progress: Option<watch::Sender<Progress>>,
     open_tx: Option<mpsc::UnboundedSender<OpenPort>>,
+    proto: Proto,
 ) -> Result<Vec<OpenPort>> {
     if ips.is_empty() || ports.is_empty() {
         return Ok(Vec::new());
@@ -117,21 +160,35 @@ pub async fn scan(
             let progress_tx = progress.clone();
             let open_tx = open_tx.clone();
             set.spawn(async move {
-                // 信号量限流：控制同时进行的连接数
+                // 信号量限流：控制同时进行的探测数
                 let _permit = sem.acquire().await.expect("信号量未关闭");
-                let addr = SocketAddr::new(ip, port);
-                let connected =
-                    timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr)).await;
-                if connected.is_ok_and(|r| r.is_ok()) {
-                    let found = OpenPort {
-                        ip,
-                        port,
-                        service: service_name(port),
-                    };
-                    open.lock().unwrap().push(found.clone());
-                    // 实时推送：GUI 等调用方收到后立即显示，无需等待扫描结束
-                    if let Some(tx) = &open_tx {
-                        let _ = tx.send(found);
+                let probes: Vec<(&'static str, ProbeState)> = match proto {
+                    Proto::Tcp => vec![("tcp", tcp_probe(ip, port, timeout_ms).await)],
+                    Proto::Udp => vec![("udp", udp_probe(ip, port, timeout_ms).await)],
+                    Proto::Both => vec![
+                        ("tcp", tcp_probe(ip, port, timeout_ms).await),
+                        ("udp", udp_probe(ip, port, timeout_ms).await),
+                    ],
+                };
+                for &(proto_name, state) in &probes {
+                    if state != ProbeState::Closed {
+                        let found = OpenPort {
+                            ip,
+                            port,
+                            proto: proto_name,
+                            // UDP 端口用 UDP 专属服务表，其余用通用表
+                            service: if proto_name == "udp" {
+                                crate::ports::service_name_udp(port)
+                            } else {
+                                service_name(port)
+                            },
+                            filtered: state == ProbeState::Filtered,
+                        };
+                        open.lock().unwrap().push(found.clone());
+                        // 实时推送：GUI 等调用方收到后立即显示，无需等待扫描结束
+                        if let Some(tx) = &open_tx {
+                            let _ = tx.send(found);
+                        }
                     }
                 }
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -165,6 +222,42 @@ pub async fn scan(
     Ok(open)
 }
 
+/// TCP 探测：connect 成功即开放，否则关闭
+async fn tcp_probe(ip: IpAddr, port: u16, timeout_ms: u64) -> ProbeState {
+    let addr = SocketAddr::new(ip, port);
+    let connected = timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr)).await;
+    if connected.is_ok_and(|r| r.is_ok()) {
+        ProbeState::Open
+    } else {
+        ProbeState::Closed
+    }
+}
+
+/// UDP 探测：发送探测包后等待响应或 ICMP 不可达。
+/// - 收到响应 => Open
+/// - Windows 上 ICMP Port Unreachable 表现为 ConnectionReset/ConnectionRefused 错误 => Closed
+/// - 超时无响应 => Filtered（可能开放，也可能被防火墙丢弃）
+async fn udp_probe(ip: IpAddr, port: u16, timeout_ms: u64) -> ProbeState {
+    let Ok(socket) = UdpSocket::bind((ip, 0)).await else {
+        return ProbeState::Filtered;
+    };
+    if socket.connect((ip, port)).await.is_err() {
+        return ProbeState::Filtered;
+    }
+    // 发送 1 字节探测包；多数 UDP 服务收到空/短包后会响应或回 ICMP 不可达
+    if socket.send(&[0u8]).await.is_err() {
+        return ProbeState::Filtered;
+    }
+    let mut buf = [0u8; 64];
+    match timeout(Duration::from_millis(timeout_ms), socket.recv(&mut buf)).await {
+        Ok(Ok(_)) => ProbeState::Open,
+        Ok(Err(e)) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionRefused) => ProbeState::Closed,
+        // 其他错误或超时：无法确认，按 open|filtered 处理
+        _ => ProbeState::Filtered,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,12 +274,17 @@ mod tests {
                 }
             }
         });
-        let mut closed_port = open_port.wrapping_add(1);
+        // closed 端口从低端口段选取（避开动态端口 49152+）：其他测试用 bind(":0")
+        // 分配的端口都落在动态段，不会与这里释放的 closed 端口撞号
+        let mut closed_port = 2000u16;
         loop {
-            if closed_port == 0 || TcpListener::bind(("127.0.0.1", closed_port)).await.is_ok() {
+            if TcpListener::bind(("127.0.0.1", closed_port)).await.is_ok() {
                 break;
             }
-            closed_port = closed_port.wrapping_add(1);
+            closed_port += 1;
+            if closed_port >= 40_000 {
+                panic!("在 2000-39999 段找不到可用端口");
+            }
         }
         (open_port, closed_port)
     }
@@ -200,7 +298,7 @@ mod tests {
             concurrency: 16,
             timeout_ms: 1000,
         };
-        let res = scan(&ips, &ports, &cfg, true, None, None).await.unwrap();
+        let res = scan(&ips, &ports, &cfg, true, None, None, Proto::Tcp).await.unwrap();
         assert!(res.iter().any(|o| o.port == open_port), "应检出监听中的端口");
         assert!(
             !res.iter().any(|o| o.port == closed_port),
@@ -233,7 +331,7 @@ mod tests {
             concurrency: 1,
             timeout_ms: 1000,
         };
-        let res = scan(&ips, &ports, &cfg, true, None, None).await.unwrap();
+        let res = scan(&ips, &ports, &cfg, true, None, None, Proto::Tcp).await.unwrap();
         assert_eq!(res.len(), 2, "应恰好检出两个监听端口");
         assert!(res.iter().any(|o| o.port == open_port));
         assert!(res.iter().any(|o| o.port == open2));
@@ -249,7 +347,7 @@ mod tests {
             concurrency: 4,
             timeout_ms: 1000,
         };
-        let res = scan(&ips, &ports, &cfg, false, None, None).await.unwrap();
+        let res = scan(&ips, &ports, &cfg, false, None, None, Proto::Tcp).await.unwrap();
         assert_eq!(res.len(), 1);
     }
 
@@ -259,14 +357,18 @@ mod tests {
             concurrency: 4,
             timeout_ms: 200,
         };
-        assert!(scan(&[], &[1, 2], &cfg, true, None, None).await.unwrap().is_empty());
+        assert!(scan(&[], &[1, 2], &cfg, true, None, None, Proto::Tcp)
+            .await
+            .unwrap()
+            .is_empty());
         assert!(scan(
             &[IpAddr::from([127, 0, 0, 1])],
             &[],
             &cfg,
             true,
             None,
-            None
+            None,
+            Proto::Tcp
         )
         .await
         .unwrap()
@@ -283,7 +385,7 @@ mod tests {
             concurrency: 4,
             timeout_ms: 500,
         };
-        let res = scan(&ips, &ports, &cfg, true, Some(tx), None).await.unwrap();
+        let res = scan(&ips, &ports, &cfg, true, Some(tx), None, Proto::Tcp).await.unwrap();
         assert_eq!(res.len(), 1, "应检出监听中的端口");
         // 扫描完成后 watch 最新值应为 done == total
         assert_eq!(
@@ -304,7 +406,7 @@ mod tests {
             concurrency: 2,
             timeout_ms: 200,
         };
-        let res = scan(&ips, &ports, &cfg, true, None, None).await.unwrap();
+        let res = scan(&ips, &ports, &cfg, true, None, None, Proto::Tcp).await.unwrap();
         assert!(res.is_empty());
     }
 
@@ -323,7 +425,7 @@ mod tests {
             let ips = ips;
             let ports = ports;
             let cfg = cfg;
-            scan(&ips, &ports, &cfg, true, None, Some(open_tx)).await
+            scan(&ips, &ports, &cfg, true, None, Some(open_tx), Proto::Tcp).await
         });
         // 扫描任务未结束时，channel 就应已收到开放端口（说明是实时推送）
         let received = open_rx
@@ -333,5 +435,90 @@ mod tests {
         assert_eq!(received.port, open_port);
         let res = scan_task.await.unwrap().unwrap();
         assert_eq!(res.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn udp_detects_open_and_closed() {
+        // 本机起一个 UDP echo 服务：收到包即回包 => 应检出 open
+        let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let open_port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            loop {
+                let Ok((n, peer)) = echo.recv_from(&mut buf).await else {
+                    break;
+                };
+                let _ = echo.send_to(&buf[..n], peer).await;
+            }
+        });
+        // 找一个已释放的 UDP 端口（bind 后 drop）=> 应判 closed（Windows 回环会回 ICMP 不可达）
+        let closed_port = {
+            let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let p = s.local_addr().unwrap().port();
+            drop(s);
+            p
+        };
+        let ips = vec![IpAddr::from([127, 0, 0, 1])];
+        let ports = vec![open_port, closed_port];
+        let cfg = ScanConfig {
+            concurrency: 4,
+            timeout_ms: 500,
+        };
+        let res = scan(&ips, &ports, &cfg, true, None, None, Proto::Udp)
+            .await
+            .unwrap();
+        // 开放端口必须被检出且不是 filtered
+        assert!(
+            res.iter().any(|o| o.port == open_port && !o.filtered),
+            "应检出 UDP 开放端口"
+        );
+        // 关闭端口不应被误报为开放
+        assert!(
+            !res.iter().any(|o| o.port == closed_port && !o.filtered),
+            "关闭的 UDP 端口不应被误报为开放"
+        );
+    }
+
+    #[tokio::test]
+    async fn both_proto_scans_tcp_and_udp() {
+        // TCP 监听服务
+        let tcp_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_port = tcp_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                if tcp_listener.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+        // UDP echo 服务
+        let udp_echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_port = udp_echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            loop {
+                let Ok((n, peer)) = udp_echo.recv_from(&mut buf).await else {
+                    break;
+                };
+                let _ = udp_echo.send_to(&buf[..n], peer).await;
+            }
+        });
+        let ips = vec![IpAddr::from([127, 0, 0, 1])];
+        let ports = vec![tcp_port, udp_port];
+        let cfg = ScanConfig {
+            concurrency: 4,
+            timeout_ms: 500,
+        };
+        let res = scan(&ips, &ports, &cfg, true, None, None, Proto::Both)
+            .await
+            .unwrap();
+        assert!(
+            res.iter().any(|o| o.port == tcp_port && o.proto == "tcp"),
+            "TCP 端口应以 tcp 协议检出"
+        );
+        assert!(
+            res.iter().any(|o| o.port == udp_port && o.proto == "udp"),
+            "UDP 端口应以 udp 协议检出"
+        );
     }
 }

@@ -28,6 +28,7 @@ async fn run_scan(
     targets_text: String,
     ports_list: Vec<u16>,
     cfg: scanner::ScanConfig,
+    proto: scanner::Proto,
     progress_tx: watch::Sender<Progress>,
     open_tx: mpsc::UnboundedSender<OpenPort>,
     event_tx: mpsc::UnboundedSender<ScanEvent>,
@@ -51,20 +52,31 @@ async fn run_scan(
             return;
         }
     };
-    let res =
-        scanner::scan(&ips, &ports_list, &cfg, true, Some(progress_tx), Some(open_tx)).await;
+    let res = scanner::scan(
+        &ips,
+        &ports_list,
+        &cfg,
+        true,
+        Some(progress_tx),
+        Some(open_tx),
+        proto,
+    )
+    .await;
     let _ = event_tx.send(ScanEvent::Finished(res.map_err(|e| format!("{e:#}"))));
 }
 
 fn write_csv(results: &[OpenPort], path: &PathBuf) -> Result<(), String> {
     let mut wtr = csv::Writer::from_path(path).map_err(|e| e.to_string())?;
-    wtr.write_record(["ip", "port", "service"])
+    wtr.write_record(["ip", "port", "proto", "service", "state"])
         .map_err(|e| e.to_string())?;
     for r in results {
+        let state = if r.filtered { "open|filtered" } else { "open" };
         wtr.write_record([
             r.ip.to_string(),
             r.port.to_string(),
+            r.proto.to_string(),
             r.service.unwrap_or("").to_string(),
+            state.to_string(),
         ])
         .map_err(|e| e.to_string())?;
     }
@@ -93,6 +105,7 @@ struct ScanApp {
     ports_text: String,
     concurrency_text: String,
     timeout_text: String,
+    proto: scanner::Proto,
     // 扫描状态
     running: bool,
     canceled: bool,
@@ -102,6 +115,9 @@ struct ScanApp {
     error: Option<String>,
     // 结果
     results: Vec<OpenPort>,
+    // 状态过滤（表格显示）
+    show_open: bool,
+    show_filtered: bool,
     // 后台任务
     progress_rx: Option<watch::Receiver<Progress>>,
     open_rx: Option<mpsc::UnboundedReceiver<OpenPort>>,
@@ -116,6 +132,7 @@ impl Default for ScanApp {
             ports_text: "1-65535".into(),
             concurrency_text: "1024".into(),
             timeout_text: "1000".into(),
+            proto: scanner::Proto::Tcp,
             running: false,
             canceled: false,
             progress: None,
@@ -123,6 +140,8 @@ impl Default for ScanApp {
             started_at: None,
             error: None,
             results: Vec::new(),
+            show_open: true,
+            show_filtered: true,
             progress_rx: None,
             open_rx: None,
             event_rx: None,
@@ -172,6 +191,7 @@ impl ScanApp {
             self.targets_text.clone(),
             ports_list,
             cfg,
+            self.proto,
             progress_tx,
             open_tx,
             event_tx,
@@ -288,6 +308,20 @@ impl eframe::App for ScanApp {
                     );
                     ui.end_row();
 
+                    ui.label("协议:");
+                    egui::ComboBox::from_id_salt("proto_combo")
+                        .selected_text(match self.proto {
+                            scanner::Proto::Tcp => "TCP",
+                            scanner::Proto::Udp => "UDP",
+                            scanner::Proto::Both => "TCP+UDP",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.proto, scanner::Proto::Tcp, "TCP");
+                            ui.selectable_value(&mut self.proto, scanner::Proto::Udp, "UDP");
+                            ui.selectable_value(&mut self.proto, scanner::Proto::Both, "TCP+UDP");
+                        });
+                    ui.end_row();
+
                     ui.label("并发数:");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.concurrency_text)
@@ -356,21 +390,34 @@ impl eframe::App for ScanApp {
                         .text(text)
                         .desired_width(f32::INFINITY),
                 );
-                ui.label(format!(
-                    "已耗时 {:.1}s，已发现 {} 个开放端口",
-                    self.elapsed.as_secs_f64(),
-                    self.results.len()
-                ));
+                ui.colored_label(
+                    egui::Color32::from_rgb(56, 189, 248),
+                    format!(
+                        "已耗时 {:.1}s，已发现 {} 个开放端口",
+                        self.elapsed.as_secs_f64(),
+                        self.results.len()
+                    ),
+                );
             } else if self.canceled {
-                ui.label("已取消");
+                ui.colored_label(
+                    egui::Color32::from_rgb(251, 146, 60),
+                    egui::RichText::new("已取消").strong(),
+                );
             } else if let Some(err) = &self.error {
-                ui.colored_label(egui::Color32::RED, format!("错误: {err}"));
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 85, 85),
+                    egui::RichText::new(format!("错误: {err}")).strong(),
+                );
             } else if !self.results.is_empty() {
-                ui.label(format!(
-                    "扫描完成，共发现 {} 个开放端口（耗时 {:.1}s）",
-                    self.results.len(),
-                    self.elapsed.as_secs_f64()
-                ));
+                ui.colored_label(
+                    egui::Color32::from_rgb(80, 250, 123),
+                    egui::RichText::new(format!(
+                        "扫描完成，共发现 {} 个开放端口（耗时 {:.1}s）",
+                        self.results.len(),
+                        self.elapsed.as_secs_f64()
+                    ))
+                    .strong(),
+                );
             } else {
                 ui.weak("就绪 — 输入目标后点击「开始扫描」");
             }
@@ -385,17 +432,32 @@ impl eframe::App for ScanApp {
                 });
                 return;
             }
-            let mut rows: Vec<(IpAddr, u16, Option<&'static str>)> = self
+            // 状态过滤控件
+            ui.horizontal(|ui| {
+                ui.label("状态过滤:");
+                ui.checkbox(&mut self.show_open, "open");
+                ui.checkbox(&mut self.show_filtered, "open|filtered");
+            });
+            ui.add_space(4.0);
+            let mut rows: Vec<(IpAddr, u16, &'static str, Option<&'static str>, bool)> = self
                 .results
                 .iter()
-                .map(|r| (r.ip, r.port, r.service))
+                .filter(|r| (r.filtered && self.show_filtered) || (!r.filtered && self.show_open))
+                .map(|r| (r.ip, r.port, r.proto, r.service, r.filtered))
                 .collect();
+            if rows.is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.weak("没有匹配当前过滤条件的端口");
+                });
+                return;
+            }
             rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
             TableBuilder::new(ui)
                 .striped(true)
                 .column(Column::auto().at_least(150.0))
                 .column(Column::auto().at_least(80.0))
                 .column(Column::remainder().at_least(120.0))
+                .column(Column::auto().at_least(90.0))
                 .header(22.0, |mut header| {
                     header.col(|ui| {
                         ui.strong("IP 地址");
@@ -406,18 +468,34 @@ impl eframe::App for ScanApp {
                     header.col(|ui| {
                         ui.strong("服务");
                     });
+                    header.col(|ui| {
+                        ui.strong("状态");
+                    });
                 })
                 .body(|mut body| {
-                    for (ip, port, svc) in &rows {
+                    for (ip, port, proto, svc, filtered) in &rows {
                         body.row(18.0, |mut row| {
                             row.col(|ui| {
                                 ui.label(ip.to_string());
                             });
                             row.col(|ui| {
-                                ui.label(port.to_string());
+                                ui.label(format!("{port}/{proto}"));
                             });
                             row.col(|ui| {
                                 ui.label(svc.unwrap_or(""));
+                            });
+                            row.col(|ui| {
+                                if *filtered {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(250, 204, 21),
+                                        egui::RichText::new("open|filtered").strong(),
+                                    );
+                                } else {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(80, 250, 123),
+                                        egui::RichText::new("open").strong(),
+                                    );
+                                }
                             });
                         });
                     }

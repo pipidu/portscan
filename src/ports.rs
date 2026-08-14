@@ -321,6 +321,71 @@ pub fn service_name(port: u16) -> Option<&'static str> {
     })
 }
 
+/// UDP 端口服务名：UDP 专属/常用服务优先，未命中回退通用表（[`service_name`]）
+pub fn service_name_udp(port: u16) -> Option<&'static str> {
+    let udp_only = match port {
+        7 => "echo",
+        9 => "discard",
+        13 => "daytime",
+        17 => "qotd",
+        19 => "chargen",
+        37 => "time",
+        42 => "nameserver",
+        49 => "tacacs",
+        53 => "dns",
+        67 => "dhcp",
+        68 => "dhcp",
+        69 => "tftp",
+        123 => "ntp",
+        137 => "netbios-ns",
+        138 => "netbios-dgm",
+        161 => "snmp",
+        162 => "snmptrap",
+        500 => "isakmp",
+        514 => "syslog",
+        520 => "rip",
+        1194 => "openvpn",
+        1701 => "l2tp",
+        1812 => "radius",
+        1813 => "radius-acct",
+        1900 => "ssdp",
+        2427 => "mgcp",
+        2869 => "upnp-discovery",
+        3074 => "xbox",
+        3478 => "stun",
+        3702 => "ws-discovery",
+        4500 => "ipsec-nat",
+        5060 => "sip",
+        5061 => "sips",
+        5353 => "mdns",
+        5355 => "llmnr",
+        5683 => "coap",
+        6881 => "bittorrent",
+        // ---- 游戏服务器（UDP）----
+        2302 => "arma",
+        2456 => "valheim",
+        2457 => "valheim",
+        7777 => "terraria",
+        7778 => "terraria",
+        8211 => "palworld",
+        8766 => "steam",
+        8767 => "steam",
+        10999 => "don't-starve",
+        16261 => "project-zomboid",
+        19132 => "minecraft-bedrock",
+        19133 => "minecraft-bedrock",
+        27015 => "valve",
+        27016 => "valve",
+        27036 => "steam",
+        27900 => "quake",
+        27910 => "quake2",
+        27960 => "quake-arena",
+        34197 => "factorio",
+        _ => return service_name(port), // 回退通用映射
+    };
+    Some(udp_only)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,5 +485,28 @@ mod tests {
         // 大数据组件
         assert_eq!(service_name(50070), Some("hdfs-namenode-web"));
         assert_eq!(service_name(60010), Some("hbase-master"));
+    }
+
+    #[test]
+    fn udp_services() {
+        // UDP 专属服务
+        assert_eq!(service_name_udp(53), Some("dns"));
+        assert_eq!(service_name_udp(67), Some("dhcp"));
+        assert_eq!(service_name_udp(123), Some("ntp"));
+        assert_eq!(service_name_udp(161), Some("snmp"));
+        assert_eq!(service_name_udp(500), Some("isakmp"));
+        assert_eq!(service_name_udp(1194), Some("openvpn"));
+        assert_eq!(service_name_udp(1701), Some("l2tp"));
+        assert_eq!(service_name_udp(3478), Some("stun"));
+        assert_eq!(service_name_udp(5353), Some("mdns"));
+        assert_eq!(service_name_udp(5355), Some("llmnr"));
+        assert_eq!(service_name_udp(5683), Some("coap"));
+        // UDP 游戏服务
+        assert_eq!(service_name_udp(19132), Some("minecraft-bedrock"));
+        assert_eq!(service_name_udp(7777), Some("terraria"));
+        assert_eq!(service_name_udp(27015), Some("valve"));
+        // 未命中 UDP 表时回退通用映射
+        assert_eq!(service_name_udp(22), Some("ssh"));
+        assert_eq!(service_name_udp(443), Some("https"));
     }
 }

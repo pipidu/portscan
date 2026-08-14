@@ -49,6 +49,12 @@ portscan 192.168.1.10
 # 扫描网段 + 指定端口
 portscan 192.168.1.0/24 -p 80,443,8000-9000
 
+# UDP 扫描（无响应端口显示为 open|filtered）
+portscan 192.168.1.10 -p 53,123,161,500 -u -t 2000
+
+# TCP 与 UDP 同时扫描
+portscan 192.168.1.10 -p 80,443,53 -b -t 2000
+
 # 多目标混合输入
 portscan "192.168.1.0/24, 10.0.0.5, router.local"
 
@@ -65,10 +71,12 @@ portscan 192.168.1.0/24 --quiet --csv result.csv --json result.json
 |---|---|---|
 | `<TARGETS>` | 目标：IP / 域名 / CIDR，逗号分隔 | 必填 |
 | `-p, --ports` | 端口范围，如 `80` / `80,443` / `8000-9000` / `1-65535` | `1-65535` |
+| `-u, --udp` | UDP 扫描模式（无响应端口显示为 open\|filtered） | `false` |
+| `-b, --both` | TCP 与 UDP 同时扫描（与 `-u` 互斥） | `false` |
 | `-c, --concurrency` | 最大并发连接数（1-65535） | `1024` |
-| `-t, --timeout` | 单连接超时（毫秒） | `1000` |
+| `-t, --timeout` | 单连接超时（毫秒）；UDP 扫描建议调大（如 2000） | `1000` |
 | `--quiet` | 不显示进度（避免污染导出文件） | `false` |
-| `--csv <PATH>` | 导出 CSV（列：ip, port, service） | 无 |
+| `--csv <PATH>` | 导出 CSV（列：ip, port, proto, service, state） | 无 |
 | `--json <PATH>` | 导出 JSON | 无 |
 
 ### 输出示例

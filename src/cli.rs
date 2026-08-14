@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[command(
     name = "portscan",
     version,
-    about = "内网 TCP 端口扫描工具（默认扫描全部端口 1-65535）"
+    about = "内网 TCP/UDP 端口扫描工具（默认扫描全部端口 1-65535）"
 )]
 pub struct Cli {
     /// 扫描目标：IP 地址、主机名或 CIDR 网段（如 192.168.1.0/24）。
@@ -17,6 +17,14 @@ pub struct Cli {
     #[arg(short, long, default_value = "1-65535", value_name = "PORTS")]
     pub ports: String,
 
+    /// UDP 扫描模式（默认 TCP）。UDP 无响应端口显示为 open|filtered
+    #[arg(short, long, conflicts_with = "both")]
+    pub udp: bool,
+
+    /// TCP 与 UDP 同时扫描
+    #[arg(short, long, conflicts_with = "udp")]
+    pub both: bool,
+
     /// 最大并发连接数（1-65535）
     #[arg(
         short,
@@ -27,7 +35,7 @@ pub struct Cli {
     )]
     pub concurrency: usize,
 
-    /// 单个连接超时（毫秒）
+    /// 单个连接超时（毫秒）；UDP 扫描建议调大（如 2000）
     #[arg(short, long, default_value_t = 1000, value_name = "MS")]
     pub timeout: u64,
 

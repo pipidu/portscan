@@ -47,32 +47,46 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 3. 执行扫描
+    let proto = if cli.udp {
+        scanner::Proto::Udp
+    } else if cli.both {
+        scanner::Proto::Both
+    } else {
+        scanner::Proto::Tcp
+    };
     let started = Instant::now();
     let cfg = scanner::ScanConfig {
         concurrency: cli.concurrency,
         timeout_ms: cli.timeout,
     };
-    let results = scanner::scan(&ips, &ports, &cfg, cli.quiet, None, None).await?;
+    let results = scanner::scan(&ips, &ports, &cfg, cli.quiet, None, None, proto).await?;
     let elapsed = started.elapsed();
 
     // 4. 按 IP 分组输出开放端口（结果始终打印，quiet 仅隐藏进度与统计）
-    let mut by_ip: BTreeMap<IpAddr, Vec<u16>> = BTreeMap::new();
+    let mut by_ip: BTreeMap<IpAddr, Vec<&OpenPort>> = BTreeMap::new();
     for r in &results {
-        by_ip.entry(r.ip).or_default().push(r.port);
+        by_ip.entry(r.ip).or_default().push(r);
     }
     for (ip, port_list) in &mut by_ip {
-        port_list.sort_unstable();
+        port_list.sort_by_key(|r| r.port);
         println!("\n{} 开放端口 ({}):", ip, port_list.len());
-        for &p in port_list.iter() {
-            match ports::service_name(p) {
-                Some(svc) => println!("  {p}/tcp  ({svc})"),
-                None => println!("  {p}/tcp"),
+        for r in port_list.iter() {
+            let state = if r.filtered { " [open|filtered]" } else { "" };
+            match r.service {
+                Some(svc) => println!("  {}/{}  ({svc}){state}", r.port, r.proto),
+                None => println!("  {}/{}{state}", r.port, r.proto),
             }
         }
     }
     if !cli.quiet {
+        let filtered = results.iter().filter(|r| r.filtered).count();
+        let state_note = if filtered > 0 {
+            format!("（其中 {filtered} 个为 open|filtered）")
+        } else {
+            String::new()
+        };
         eprintln!(
-            "\n扫描完成: {} 个探测点, 耗时 {:.2}s, 共发现 {} 个开放端口",
+            "\n扫描完成: {} 个探测点, 耗时 {:.2}s, 共发现 {} 个开放端口{state_note}",
             total,
             elapsed.as_secs_f64(),
             results.len()
@@ -83,12 +97,15 @@ async fn main() -> anyhow::Result<()> {
     if let Some(path) = &cli.csv {
         let mut wtr = csv::Writer::from_path(path)
             .with_context(|| format!("无法创建 CSV 文件: {}", path.display()))?;
-        wtr.write_record(["ip", "port", "service"])?;
+        wtr.write_record(["ip", "port", "proto", "service", "state"])?;
         for r in &results {
+            let state = if r.filtered { "open|filtered" } else { "open" };
             wtr.write_record([
                 r.ip.to_string(),
                 r.port.to_string(),
+                r.proto.to_string(),
                 r.service.unwrap_or("").to_string(),
+                state.to_string(),
             ])
             .with_context(|| format!("写入 CSV 失败: {}", path.display()))?;
         }
