@@ -505,65 +505,66 @@ impl eframe::App for ScanApp {
         // ---- 底部状态区 ----
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.add_space(4.0);
-            if self.running {
-                let (done, total) = match self.progress {
-                    Some(p) if p.total > 0 => (p.done, p.total),
-                    _ => (0, 0),
-                };
-                let open_n = self.open_count();
-                // 分段进度条：绿=已扫描开放端口，红=已扫描非开放，灰=未扫描
-                let total_w = ui.available_width();
-                let (green_w, red_w) = if total > 0 {
-                    (
-                        total_w * (open_n as f32 / total as f32),
-                        total_w * (done.saturating_sub(open_n) as f32 / total as f32),
-                    )
-                } else {
-                    (0.0, 0.0)
-                };
-                let gray_w = (total_w - green_w - red_w).max(0.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    // 圆角为 0：颜色接缝处为直线
-                    if green_w > 0.0 {
-                        ui.add(
-                            egui::ProgressBar::new(1.0)
-                                .fill(egui::Color32::from_rgb(34, 197, 94))
-                                .corner_radius(egui::CornerRadius::ZERO)
-                                .desired_width(green_w),
-                        );
-                    }
-                    if red_w > 0.0 {
-                        ui.add(
-                            egui::ProgressBar::new(1.0)
-                                .fill(egui::Color32::from_rgb(239, 68, 68))
-                                .corner_radius(egui::CornerRadius::ZERO)
-                                .desired_width(red_w),
-                        );
-                    }
-                    if gray_w > 0.0 {
-                        ui.add(
-                            egui::ProgressBar::new(1.0)
-                                .fill(egui::Color32::from_rgb(75, 85, 99))
-                                .corner_radius(egui::CornerRadius::ZERO)
-                                .desired_width(gray_w),
-                        );
-                    }
-                });
-                if total > 0 {
-                    ui.weak(format!(
-                        "{done}/{total} ({:.1}%) · 开放 {open_n} 个",
-                        done as f32 * 100.0 / total as f32
-                    ));
-                } else {
-                    ui.weak("准备中...");
+            // 常态进度条：绿=已扫描开放端口，红=已扫描非开放，灰=未扫描
+            let (done, total) = match self.progress {
+                Some(p) if p.total > 0 => (p.done, p.total),
+                _ => (0, 0),
+            };
+            let open_n = self.open_count();
+            let total_w = ui.available_width();
+            let (green_w, red_w) = if total > 0 {
+                (
+                    total_w * (open_n as f32 / total as f32),
+                    total_w * (done.saturating_sub(open_n) as f32 / total as f32),
+                )
+            } else {
+                (0.0, 0.0)
+            };
+            let gray_w = (total_w - green_w - red_w).max(0.0);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                // 圆角为 0：颜色接缝处为直线
+                if green_w > 0.0 {
+                    ui.add(
+                        egui::ProgressBar::new(1.0)
+                            .fill(egui::Color32::from_rgb(34, 197, 94))
+                            .corner_radius(egui::CornerRadius::ZERO)
+                            .desired_width(green_w),
+                    );
                 }
+                if red_w > 0.0 {
+                    ui.add(
+                        egui::ProgressBar::new(1.0)
+                            .fill(egui::Color32::from_rgb(239, 68, 68))
+                            .corner_radius(egui::CornerRadius::ZERO)
+                            .desired_width(red_w),
+                    );
+                }
+                if gray_w > 0.0 {
+                    ui.add(
+                        egui::ProgressBar::new(1.0)
+                            .fill(egui::Color32::from_rgb(75, 85, 99))
+                            .corner_radius(egui::CornerRadius::ZERO)
+                            .desired_width(gray_w),
+                    );
+                }
+            });
+            // 统计行（常态显示）
+            if self.running {
+                ui.weak(format!(
+                    "{done}/{total} ({:.1}%) · 开放 {open_n} 个",
+                    done as f32 * 100.0 / total as f32
+                ));
+            } else if total > 0 {
+                ui.weak(format!("共 {total} 个探测点 · 开放 {open_n} 个"));
+            } else {
+                ui.weak("等待扫描");
+            }
+            // 状态文字
+            if self.running {
                 stroked_text(
                     ui,
-                    format!(
-                        "● 已耗时 {:.1}s",
-                        self.elapsed.as_secs_f64()
-                    ),
+                    format!("● 已耗时 {:.1}s", self.elapsed.as_secs_f64()),
                     egui::Color32::from_rgb(59, 130, 246),
                 );
             } else if self.canceled {
