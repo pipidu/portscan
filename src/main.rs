@@ -52,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
         concurrency: cli.concurrency,
         timeout_ms: cli.timeout,
     };
-    let results = scanner::scan(&ips, &ports, &cfg, cli.quiet, None).await?;
+    let results = scanner::scan(&ips, &ports, &cfg, cli.quiet, None, None).await?;
     let elapsed = started.elapsed();
 
     // 4. 按 IP 分组输出开放端口（结果始终打印，quiet 仅隐藏进度与统计）

@@ -29,6 +29,7 @@ async fn run_scan(
     ports_list: Vec<u16>,
     cfg: scanner::ScanConfig,
     progress_tx: watch::Sender<Progress>,
+    open_tx: mpsc::UnboundedSender<OpenPort>,
     event_tx: mpsc::UnboundedSender<ScanEvent>,
 ) {
     let parsed = tokio::task::spawn_blocking(move || {
@@ -50,7 +51,8 @@ async fn run_scan(
             return;
         }
     };
-    let res = scanner::scan(&ips, &ports_list, &cfg, true, Some(progress_tx)).await;
+    let res =
+        scanner::scan(&ips, &ports_list, &cfg, true, Some(progress_tx), Some(open_tx)).await;
     let _ = event_tx.send(ScanEvent::Finished(res.map_err(|e| format!("{e:#}"))));
 }
 
@@ -102,6 +104,7 @@ struct ScanApp {
     results: Vec<OpenPort>,
     // 后台任务
     progress_rx: Option<watch::Receiver<Progress>>,
+    open_rx: Option<mpsc::UnboundedReceiver<OpenPort>>,
     event_rx: Option<mpsc::UnboundedReceiver<ScanEvent>>,
     handle: Option<JoinHandle<()>>,
 }
@@ -121,6 +124,7 @@ impl Default for ScanApp {
             error: None,
             results: Vec::new(),
             progress_rx: None,
+            open_rx: None,
             event_rx: None,
             handle: None,
         }
@@ -161,17 +165,19 @@ impl ScanApp {
             timeout_ms,
         };
         // 进度 watch channel（只保留最新值，UI 读取不积压）与结果 channel 分离
-        let (progress_tx, progress_rx) =
-            watch::channel(Progress { done: 0, total: 0 });
+        let (progress_tx, progress_rx) = watch::channel(Progress { done: 0, total: 0 });
+        let (open_tx, open_rx) = mpsc::unbounded_channel::<OpenPort>();
         let (event_tx, event_rx) = mpsc::unbounded_channel::<ScanEvent>();
         let handle = runtime().spawn(run_scan(
             self.targets_text.clone(),
             ports_list,
             cfg,
             progress_tx,
+            open_tx,
             event_tx,
         ));
         self.progress_rx = Some(progress_rx);
+        self.open_rx = Some(open_rx);
         self.event_rx = Some(event_rx);
         self.handle = Some(handle);
         self.running = true;
@@ -191,6 +197,7 @@ impl ScanApp {
         self.canceled = true;
         self.event_rx = None;
         self.progress_rx = None;
+        self.open_rx = None;
         self.progress = None;
         self.started_at = None;
     }
@@ -200,6 +207,12 @@ impl ScanApp {
         if let Some(rx) = &mut self.progress_rx {
             if rx.has_changed().unwrap_or(false) {
                 self.progress = Some(*rx.borrow_and_update());
+            }
+        }
+        // 实时开放端口：扫描过程中边发现边追加到结果表格
+        if let Some(rx) = &mut self.open_rx {
+            while let Ok(op) = rx.try_recv() {
+                self.results.push(op);
             }
         }
         // 完成/失败消息（至多一条，收到即结束）
@@ -215,6 +228,7 @@ impl ScanApp {
             self.handle = None;
             self.event_rx = None;
             self.progress_rx = None;
+            self.open_rx = None;
             self.started_at = None;
         }
     }
@@ -342,7 +356,11 @@ impl eframe::App for ScanApp {
                         .text(text)
                         .desired_width(f32::INFINITY),
                 );
-                ui.label(format!("已耗时 {:.1}s", self.elapsed.as_secs_f64()));
+                ui.label(format!(
+                    "已耗时 {:.1}s，已发现 {} 个开放端口",
+                    self.elapsed.as_secs_f64(),
+                    self.results.len()
+                ));
             } else if self.canceled {
                 ui.label("已取消");
             } else if let Some(err) = &self.error {

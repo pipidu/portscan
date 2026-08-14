@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{mpsc, watch, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
@@ -47,13 +47,16 @@ impl Drop for CancelGuard {
 /// 信号量限制同时进行的连接数。空输入直接返回空结果。
 ///
 /// `quiet` 为 true 时不向 stderr 输出进度；
-/// `progress` 提供时，进度通过 watch channel 实时更新（CLI 传 None 保持原行为）。
+/// `progress` 提供时，进度通过 watch channel 实时更新；
+/// `open_tx` 提供时，每个新发现的开放端口都会立即通过 mpsc channel 推送
+/// （CLI 两者均传 None 保持原行为）。
 pub async fn scan(
     ips: &[IpAddr],
     ports: &[u16],
     cfg: &ScanConfig,
     quiet: bool,
     progress: Option<watch::Sender<Progress>>,
+    open_tx: Option<mpsc::UnboundedSender<OpenPort>>,
 ) -> Result<Vec<OpenPort>> {
     if ips.is_empty() || ports.is_empty() {
         return Ok(Vec::new());
@@ -112,6 +115,7 @@ pub async fn scan(
             let done = Arc::clone(&done);
             let open = Arc::clone(&open);
             let progress_tx = progress.clone();
+            let open_tx = open_tx.clone();
             set.spawn(async move {
                 // 信号量限流：控制同时进行的连接数
                 let _permit = sem.acquire().await.expect("信号量未关闭");
@@ -119,11 +123,16 @@ pub async fn scan(
                 let connected =
                     timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr)).await;
                 if connected.is_ok_and(|r| r.is_ok()) {
-                    open.lock().unwrap().push(OpenPort {
+                    let found = OpenPort {
                         ip,
                         port,
                         service: service_name(port),
-                    });
+                    };
+                    open.lock().unwrap().push(found.clone());
+                    // 实时推送：GUI 等调用方收到后立即显示，无需等待扫描结束
+                    if let Some(tx) = &open_tx {
+                        let _ = tx.send(found);
+                    }
                 }
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if let Some(tx) = &progress_tx {
@@ -191,7 +200,7 @@ mod tests {
             concurrency: 16,
             timeout_ms: 1000,
         };
-        let res = scan(&ips, &ports, &cfg, true, None).await.unwrap();
+        let res = scan(&ips, &ports, &cfg, true, None, None).await.unwrap();
         assert!(res.iter().any(|o| o.port == open_port), "应检出监听中的端口");
         assert!(
             !res.iter().any(|o| o.port == closed_port),
@@ -224,7 +233,7 @@ mod tests {
             concurrency: 1,
             timeout_ms: 1000,
         };
-        let res = scan(&ips, &ports, &cfg, true, None).await.unwrap();
+        let res = scan(&ips, &ports, &cfg, true, None, None).await.unwrap();
         assert_eq!(res.len(), 2, "应恰好检出两个监听端口");
         assert!(res.iter().any(|o| o.port == open_port));
         assert!(res.iter().any(|o| o.port == open2));
@@ -240,7 +249,7 @@ mod tests {
             concurrency: 4,
             timeout_ms: 1000,
         };
-        let res = scan(&ips, &ports, &cfg, false, None).await.unwrap();
+        let res = scan(&ips, &ports, &cfg, false, None, None).await.unwrap();
         assert_eq!(res.len(), 1);
     }
 
@@ -250,12 +259,13 @@ mod tests {
             concurrency: 4,
             timeout_ms: 200,
         };
-        assert!(scan(&[], &[1, 2], &cfg, true, None).await.unwrap().is_empty());
+        assert!(scan(&[], &[1, 2], &cfg, true, None, None).await.unwrap().is_empty());
         assert!(scan(
             &[IpAddr::from([127, 0, 0, 1])],
             &[],
             &cfg,
             true,
+            None,
             None
         )
         .await
@@ -273,7 +283,7 @@ mod tests {
             concurrency: 4,
             timeout_ms: 500,
         };
-        let res = scan(&ips, &ports, &cfg, true, Some(tx)).await.unwrap();
+        let res = scan(&ips, &ports, &cfg, true, Some(tx), None).await.unwrap();
         assert_eq!(res.len(), 1, "应检出监听中的端口");
         // 扫描完成后 watch 最新值应为 done == total
         assert_eq!(
@@ -294,7 +304,34 @@ mod tests {
             concurrency: 2,
             timeout_ms: 200,
         };
-        let res = scan(&ips, &ports, &cfg, true, None).await.unwrap();
+        let res = scan(&ips, &ports, &cfg, true, None, None).await.unwrap();
         assert!(res.is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_ports_pushed_in_realtime() {
+        // 通过 open_tx 推送：扫描过程中（未结束时）即可收到开放端口，而非等全部完成
+        let (open_port, _closed_port) = probe_ports().await;
+        let (open_tx, mut open_rx) = mpsc::unbounded_channel::<OpenPort>();
+        let ips = vec![IpAddr::from([127, 0, 0, 1])];
+        let ports = vec![open_port];
+        let cfg = ScanConfig {
+            concurrency: 4,
+            timeout_ms: 500,
+        };
+        let scan_task = tokio::spawn(async move {
+            let ips = ips;
+            let ports = ports;
+            let cfg = cfg;
+            scan(&ips, &ports, &cfg, true, None, Some(open_tx)).await
+        });
+        // 扫描任务未结束时，channel 就应已收到开放端口（说明是实时推送）
+        let received = open_rx
+            .recv()
+            .await
+            .expect("扫描结束前应实时收到开放端口");
+        assert_eq!(received.port, open_port);
+        let res = scan_task.await.unwrap().unwrap();
+        assert_eq!(res.len(), 1);
     }
 }
