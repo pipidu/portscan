@@ -662,10 +662,11 @@ fn stroked_text(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>, color: egu
         .into()
         .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, font_id.clone());
     let pos = ui.cursor().min + egui::vec2(0.0, ui.spacing().item_spacing.y);
-    let black = egui::Color32::BLACK;
-    // 仅 4 个正交方向偏移（上下左右），避免对角叠加导致描边过粗
+    // 灰色描边：仅 4 个正交方向偏移（上下左右），避免对角叠加导致描边过粗
+    let stroke_color = egui::Color32::from_rgb(100, 100, 100);
     for (dx, dy) in [(-1.0f32, 0.0f32), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
-        ui.painter().galley(pos + egui::vec2(dx, dy), galley.clone(), black);
+        ui.painter()
+            .galley(pos + egui::vec2(dx, dy), galley.clone(), stroke_color);
     }
     ui.painter().galley(pos, galley.clone(), color);
     ui.advance_cursor_after_rect(galley.rect.translate(pos.to_vec2()));
