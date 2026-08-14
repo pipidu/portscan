@@ -524,10 +524,12 @@ impl eframe::App for ScanApp {
                 let gray_w = (total_w - green_w - red_w).max(0.0);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
+                    // 圆角为 0：颜色接缝处为直线
                     if green_w > 0.0 {
                         ui.add(
                             egui::ProgressBar::new(1.0)
                                 .fill(egui::Color32::from_rgb(34, 197, 94))
+                                .corner_radius(egui::CornerRadius::ZERO)
                                 .desired_width(green_w),
                         );
                     }
@@ -535,6 +537,7 @@ impl eframe::App for ScanApp {
                         ui.add(
                             egui::ProgressBar::new(1.0)
                                 .fill(egui::Color32::from_rgb(239, 68, 68))
+                                .corner_radius(egui::CornerRadius::ZERO)
                                 .desired_width(red_w),
                         );
                     }
@@ -542,6 +545,7 @@ impl eframe::App for ScanApp {
                         ui.add(
                             egui::ProgressBar::new(1.0)
                                 .fill(egui::Color32::from_rgb(75, 85, 99))
+                                .corner_radius(egui::CornerRadius::ZERO)
                                 .desired_width(gray_w),
                         );
                     }
