@@ -756,10 +756,10 @@ impl eframe::App for ScanApp {
             };
             TableBuilder::new(ui)
                 .striped(true)
-                .column(Column::auto().at_least(150.0))
-                .column(Column::auto().at_least(80.0))
-                .column(Column::remainder().at_least(120.0))
+                .column(Column::remainder().at_least(200.0)) // IP：弹性列，IPv6 完整显示
                 .column(Column::auto().at_least(90.0))
+                .column(Column::auto().at_least(90.0)) // 服务：内容短，列宽收紧
+                .column(Column::auto().at_least(130.0)) // 延迟：单行显示三值
                 .column(Column::auto().at_least(90.0))
                 .header(22.0, |mut header| {
                     header.col(|ui| header_btn(ui, "IP 地址", SortCol::Ip, self));
@@ -772,24 +772,32 @@ impl eframe::App for ScanApp {
                     for (ip, port, proto, svc, latency, filtered, suspicious) in &rows {
                         body.row(18.0, |mut row| {
                             row.col(|ui| {
-                                ui.label(ip.to_string());
+                                // IP：单行不换行（IPv6 完整地址）
+                                ui.add(
+                                    egui::Label::new(ip.to_string())
+                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                );
                             });
                             row.col(|ui| {
                                 ui.label(format!("{port}/{proto}"));
                             });
                             row.col(|ui| {
-                                ui.label(svc.unwrap_or(""));
+                                ui.add(
+                                    egui::Label::new(svc.unwrap_or(""))
+                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                );
                             });
                             row.col(|ui| {
                                 let text = if latency.is_empty() {
                                     String::new()
                                 } else {
-                                    format!(
-                                        "{}ms",
-                                        portscan::report::latency_display(latency)
-                                    )
+                                    format!("{}ms", portscan::report::latency_display(latency))
                                 };
-                                ui.label(text);
+                                // 延迟：单行完整显示三值，不换行
+                                ui.add(
+                                    egui::Label::new(text)
+                                        .wrap_mode(egui::TextWrapMode::Extend),
+                                );
                             });
                             row.col(|ui| {
                                 if *suspicious {
