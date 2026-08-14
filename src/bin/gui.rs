@@ -290,6 +290,14 @@ impl ScanApp {
         }
     }
 
+    /// 底栏开放端口数（仅统计确认 open 状态，不含可疑/过滤）
+    fn open_count(&self) -> usize {
+        self.results
+            .iter()
+            .filter(|r| !r.suspicious && !r.filtered)
+            .count()
+    }
+
     fn toggle_sort(&mut self, col: SortCol) {
         if self.sort_col == col {
             self.sort_asc = !self.sort_asc;
@@ -440,36 +448,43 @@ impl eframe::App for ScanApp {
                         .text(text)
                         .desired_width(f32::INFINITY),
                 );
-                ui.colored_label(
-                    egui::Color32::from_rgb(56, 189, 248),
+                stroked_text(
+                    ui,
                     format!(
                         "已耗时 {:.1}s，已发现 {} 个开放端口",
                         self.elapsed.as_secs_f64(),
-                        self.results.len()
+                        self.open_count()
                     ),
+                    egui::Color32::from_rgb(56, 189, 248),
                 );
             } else if self.canceled {
-                ui.colored_label(
+                stroked_text(
+                    ui,
+                    "已取消",
                     egui::Color32::from_rgb(251, 146, 60),
-                    egui::RichText::new("已取消").strong(),
                 );
             } else if let Some(err) = &self.error {
-                ui.colored_label(
+                stroked_text(
+                    ui,
+                    format!("错误: {err}"),
                     egui::Color32::from_rgb(255, 85, 85),
-                    egui::RichText::new(format!("错误: {err}")).strong(),
                 );
             } else if !self.results.is_empty() {
-                ui.colored_label(
-                    egui::Color32::from_rgb(80, 250, 123),
-                    egui::RichText::new(format!(
+                stroked_text(
+                    ui,
+                    format!(
                         "扫描完成，共发现 {} 个开放端口（耗时 {:.1}s）",
-                        self.results.len(),
+                        self.open_count(),
                         self.elapsed.as_secs_f64()
-                    ))
-                    .strong(),
+                    ),
+                    egui::Color32::from_rgb(80, 250, 123),
                 );
             } else {
-                ui.weak("就绪 — 输入目标后点击「开始扫描」");
+                stroked_text(
+                    ui,
+                    "就绪 — 输入目标后点击「开始扫描」",
+                    egui::Color32::from_rgb(170, 170, 170),
+                );
             }
             ui.add_space(4.0);
         });
@@ -594,19 +609,22 @@ impl eframe::App for ScanApp {
                             });
                             row.col(|ui| {
                                 if *suspicious {
-                                    ui.colored_label(
+                                    stroked_text(
+                                        ui,
+                                        "可疑",
                                         egui::Color32::from_rgb(251, 146, 60),
-                                        egui::RichText::new("可疑").strong(),
                                     );
                                 } else if *filtered {
-                                    ui.colored_label(
+                                    stroked_text(
+                                        ui,
+                                        "open|filtered",
                                         egui::Color32::from_rgb(250, 204, 21),
-                                        egui::RichText::new("open|filtered").strong(),
                                     );
                                 } else {
-                                    ui.colored_label(
+                                    stroked_text(
+                                        ui,
+                                        "open",
                                         egui::Color32::from_rgb(80, 250, 123),
-                                        egui::RichText::new("open").strong(),
                                     );
                                 }
                             });
@@ -635,6 +653,26 @@ fn state_rank(r: &ResultRow) -> u8 {
     } else {
         0
     }
+}
+
+/// 绘制带黑色描边的彩色文字（8 方向偏移绘制黑色轮廓，保证任意背景下可读）
+fn stroked_text(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>, color: egui::Color32) {
+    let font_id = egui::FontId::proportional(14.0);
+    let galley = text
+        .into()
+        .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, font_id.clone());
+    let pos = ui.cursor().min + egui::vec2(0.0, ui.spacing().item_spacing.y);
+    let black = egui::Color32::BLACK;
+    for dx in [-1.0f32, 0.0, 1.0] {
+        for dy in [-1.0f32, 0.0, 1.0] {
+            if dx == 0.0 && dy == 0.0 {
+                continue;
+            }
+            ui.painter().galley(pos + egui::vec2(dx, dy), galley.clone(), black);
+        }
+    }
+    ui.painter().galley(pos, galley.clone(), color);
+    ui.advance_cursor_after_rect(galley.rect.translate(pos.to_vec2()));
 }
 
 /// 加载系统中文字体，解决 egui 默认字体不含 CJK 字符导致的乱码/方块问题

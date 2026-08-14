@@ -1,7 +1,7 @@
 use anyhow::{bail, Context};
 use cidr::IpCidr;
 use std::collections::BTreeSet;
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
 /// 单次展开的目标地址数上限，防止误扫超大网段（如 10.0.0.0/8）耗尽内存
 pub const MAX_TARGETS: usize = 1_000_000;
@@ -18,9 +18,45 @@ pub fn expand_targets(raw: &[String]) -> anyhow::Result<Vec<IpAddr>> {
                 continue;
             }
             if part.contains('/') {
-                let cidr: IpCidr = part
-                    .parse()
+                // 手动拆分地址与前缀：cidr crate 的 FromStr 不接受 host bits 非零
+                // 的地址（如 192.168.1.1/24），这里计算网络地址后构造
+                let (addr_s, prefix_s) = part
+                    .split_once('/')
                     .with_context(|| format!("无效的 CIDR 网段: {part}"))?;
+                let addr: IpAddr = addr_s
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("无效的 CIDR 地址: {part}"))?;
+                let prefix: u8 = prefix_s
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("无效的 CIDR 前缀: {part}"))?;
+                let cidr: IpCidr = match addr {
+                    IpAddr::V4(v4) => {
+                        if prefix > 32 {
+                            bail!("CIDR 前缀长度无效: {part}");
+                        }
+                        let mask = if prefix == 0 {
+                            0
+                        } else {
+                            u32::MAX << (32 - prefix as u32)
+                        };
+                        let network = Ipv4Addr::from(u32::from(v4) & mask);
+                        IpCidr::V4(cidr::Ipv4Cidr::new(network, prefix).expect("网络地址 host part 为 0"))
+                    }
+                    IpAddr::V6(v6) => {
+                        if prefix > 128 {
+                            bail!("CIDR 前缀长度无效: {part}");
+                        }
+                        let mask = if prefix == 0 {
+                            0
+                        } else {
+                            u128::MAX << (128 - prefix as u32)
+                        };
+                        let network = Ipv6Addr::from(u128::from(v6) & mask);
+                        IpCidr::V6(cidr::Ipv6Cidr::new(network, prefix).expect("网络地址 host part 为 0"))
+                    }
+                };
                 for ip in cidr.iter() {
                     set.insert(ip.address());
                     if set.len() > MAX_TARGETS {
@@ -64,6 +100,22 @@ mod tests {
         assert_eq!(ips.len(), 4);
         assert_eq!(ips[0], "192.168.1.0".parse::<IpAddr>().unwrap());
         assert_eq!(ips[3], "192.168.1.3".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn expands_cidr_host_address() {
+        // 主机地址 + 前缀（192.168.1.1/24）应忽略 host bits 按网络展开
+        let ips = expand_targets(&["192.168.1.1/24".into()]).unwrap();
+        assert_eq!(ips.len(), 256);
+        assert_eq!(ips[0], "192.168.1.0".parse::<IpAddr>().unwrap());
+        assert_eq!(ips[255], "192.168.1.255".parse::<IpAddr>().unwrap());
+        // IPv6 主机地址 + 前缀
+        let ips = expand_targets(&["2001:db8::1/120".into()]).unwrap();
+        assert_eq!(ips.len(), 256);
+        assert_eq!(ips[0], "2001:db8::".parse::<IpAddr>().unwrap());
+        // 前缀超范围应报错
+        assert!(expand_targets(&["192.168.1.1/33".into()]).is_err());
+        assert!(expand_targets(&["2001:db8::1/129".into()]).is_err());
     }
 
     #[test]
