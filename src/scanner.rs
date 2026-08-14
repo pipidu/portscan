@@ -228,11 +228,23 @@ pub async fn scan(
     Ok(open)
 }
 
+/// 邮件端口（25/110/143）的协议探测 payload：用于识别「连接成功但静默」的劫持/tcpwrapped。
+/// 真实邮件服务器必然响应这些协议命令，劫持方（代答 SYN-ACK 后不转发）不会响应。
+fn tcp_probe_payload(port: u16) -> Option<&'static [u8]> {
+    Some(match port {
+        25 => b"EHLO probe\r\n",    // SMTP
+        110 => b"CAPA\r\n",         // POP3
+        143 => b"CAPABILITY\r\n",   // IMAP
+        _ => return None,
+    })
+}
+
 /// TCP 探测：connect 成功即开放，否则关闭。
-/// 连接成功后额外等待一个短窗口读取数据：
-/// - 收到数据（banner）=> Open（真实服务）
-/// - 立即收到 RST/FIN（EOF）=> Suspicious（tcpwrapped/劫持特征）
-/// - 超时无响应 => Open（真实服务可能静默等待客户端先发言，不能误判）
+/// 连接成功后：
+/// - 对 25/110/143 发送协议探测并等待响应——收到数据 => Open；
+///   立即 RST/FIN 或超时无响应 => Suspicious（劫持/tcpwrapped 特征）
+/// - 其他端口：收到数据（banner）=> Open；立即 RST/FIN => Suspicious；
+///   超时无响应 => Open（真实服务可能静默等待客户端先发言，不能误伤）
 async fn tcp_probe(ip: IpAddr, port: u16, timeout_ms: u64) -> ProbeState {
     let addr = SocketAddr::new(ip, port);
     // timeout 外层返回 Result<Result<TcpStream>, Elapsed>，需双层解包
@@ -243,15 +255,19 @@ async fn tcp_probe(ip: IpAddr, port: u16, timeout_ms: u64) -> ProbeState {
     let Ok(stream) = connect_result else {
         return ProbeState::Closed;
     };
-    // 连接成功后的检测窗口：等待可读或错误
-    // - 收到数据（banner）=> Open（真实服务）
-    // - EOF（try_read 返回 0）或 RST => Suspicious（tcpwrapped/劫持特征）
-    // - 超时无响应 => Open（真实服务可能静默等待客户端先发言，不能误判）
+    let dur = Duration::from_millis(timeout_ms);
+    let payload = tcp_probe_payload(port);
+    // 发送协议探测（仅 25/110/143）
+    if let Some(p) = payload {
+        if timeout(dur, stream.writable()).await.is_ok() {
+            let _ = stream.try_write(p);
+        }
+    }
     let mut buf = [0u8; 256];
-    match timeout(Duration::from_millis(timeout_ms), stream.readable()).await {
+    match timeout(dur, stream.readable()).await {
         Ok(Ok(())) => match stream.try_read(&mut buf) {
             Ok(0) => ProbeState::Suspicious, // EOF：对端建立连接后立即关闭
-            Ok(_) => ProbeState::Open,       // 收到 banner
+            Ok(_) => ProbeState::Open,       // 收到 banner 或对探测的响应
             Err(e)
                 if matches!(
                     e.kind(),
@@ -263,8 +279,14 @@ async fn tcp_probe(ip: IpAddr, port: u16, timeout_ms: u64) -> ProbeState {
             // 其他错误（含 WouldBlock 竞态）：无法证明劫持，保守判 Open
             Err(_) => ProbeState::Open,
         },
-        // readable() 本身出错或超时：无证据判劫持，保持 Open
-        _ => ProbeState::Open,
+        // 超时无响应：发过 probe 仍无响应 => 疑似劫持；未发 probe => 保持 Open
+        _ => {
+            if payload.is_some() {
+                ProbeState::Suspicious
+            } else {
+                ProbeState::Open
+            }
+        }
     }
 }
 
@@ -528,6 +550,40 @@ mod tests {
             }
         });
         let state = tcp_probe(IpAddr::from([127, 0, 0, 1]), port, 500).await;
+        assert_eq!(state, ProbeState::Suspicious);
+    }
+
+    #[test]
+    fn mail_ports_have_probe_payloads() {
+        // 邮件端口应有协议探测 payload；其他端口不应有（避免误伤 TLS/SSH 等）
+        assert!(tcp_probe_payload(25).is_some());
+        assert!(tcp_probe_payload(110).is_some());
+        assert!(tcp_probe_payload(143).is_some());
+        assert!(tcp_probe_payload(22).is_none());
+        assert!(tcp_probe_payload(443).is_none());
+        assert!(tcp_probe_payload(3389).is_none());
+    }
+
+    #[tokio::test]
+    async fn smtp_silent_service_marked_suspicious() {
+        // 25 端口 accept 后读取数据但不响应（模拟网关劫持/静默 tcpwrapped）
+        let Ok(listener) = TcpListener::bind("127.0.0.1:25").await else {
+            eprintln!("跳过：本机 25 端口不可用");
+            return;
+        };
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                // 等待读取探测数据但静默不响应
+                let _ = sock.readable().await;
+                let mut buf = [0u8; 64];
+                let _ = sock.try_read(&mut buf);
+            }
+        });
+        // 客户端仍持有连接（服务端未关闭）=> readable 超时 => 发过 probe => Suspicious
+        let state = tcp_probe(IpAddr::from([127, 0, 0, 1]), 25, 400).await;
         assert_eq!(state, ProbeState::Suspicious);
     }
 
