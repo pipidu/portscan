@@ -147,6 +147,10 @@ struct ScanApp {
     // 表格排序
     sort_col: SortCol,
     sort_asc: bool,
+    // 目标数量（异步解析，用于显示探测点总数）
+    target_count: Option<usize>,
+    target_count_for: String,
+    target_count_rx: Option<mpsc::UnboundedReceiver<usize>>,
     // 后台任务
     progress_rx: Option<watch::Receiver<Progress>>,
     open_rx: Option<mpsc::UnboundedReceiver<OpenPort>>,
@@ -175,6 +179,9 @@ impl Default for ScanApp {
             show_filtered: false,
             sort_col: SortCol::Port,
             sort_asc: true,
+            target_count: None,
+            target_count_for: String::new(),
+            target_count_rx: None,
             progress_rx: None,
             open_rx: None,
             event_rx: None,
@@ -260,6 +267,28 @@ impl ScanApp {
     }
 
     fn poll_events(&mut self) {
+        // 目标数量异步解析：输入变化时在阻塞线程解析（DNS 可能慢），完成后经 channel 回传
+        if self.target_count_for != self.targets_text {
+            self.target_count_for = self.targets_text.clone();
+            self.target_count = None;
+            if !self.targets_text.trim().is_empty() {
+                let (tx, rx) = mpsc::unbounded_channel();
+                self.target_count_rx = Some(rx);
+                let text = self.targets_text.clone();
+                runtime().spawn_blocking(move || {
+                    let n = target::expand_targets(&[text])
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    let _ = tx.send(n);
+                });
+            }
+        }
+        if let Some(rx) = &mut self.target_count_rx {
+            if let Ok(n) = rx.try_recv() {
+                self.target_count = Some(n);
+                self.target_count_rx = None;
+            }
+        }
         // 进度（watch 只保留最新值）
         if let Some(rx) = &mut self.progress_rx {
             if rx.has_changed().unwrap_or(false) {
@@ -427,16 +456,22 @@ impl eframe::App for ScanApp {
                     self.export_dialog("json");
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // 端口数量提示
+                    // 探测点总数：IP 数 × 端口数（目标数异步解析，含域名时稍候）
                     let port_count = if self.common_ports {
                         Some(ports::COMMON_PORTS.len())
                     } else {
                         ports::parse_ports(&self.ports_text).ok().map(|p| p.len())
                     };
-                    if let Some(n) = port_count {
-                        ui.weak(format!("端口数: {n}"));
-                    } else {
-                        ui.weak("端口数: —");
+                    match (self.target_count, port_count) {
+                        (Some(ips), Some(ps)) if ips > 0 => {
+                            ui.weak(format!(
+                                "探测点: {ips}×{ps}={}",
+                                ips as u64 * ps as u64
+                            ));
+                        }
+                        _ => {
+                            ui.weak("探测点: —");
+                        }
                     }
                 });
             });
@@ -473,15 +508,15 @@ impl eframe::App for ScanApp {
                         self.elapsed.as_secs_f64(),
                         self.open_count()
                     ),
-                    egui::Color32::from_rgb(56, 189, 248),
+                    egui::Color32::from_rgb(59, 130, 246),
                 );
             } else if self.canceled {
-                stroked_text(ui, "■ 已取消", egui::Color32::from_rgb(251, 146, 60));
+                stroked_text(ui, "■ 已取消", egui::Color32::from_rgb(249, 115, 22));
             } else if let Some(err) = &self.error {
                 stroked_text(
                     ui,
                     format!("✗ 错误: {err}"),
-                    egui::Color32::from_rgb(255, 85, 85),
+                    egui::Color32::from_rgb(239, 68, 68),
                 );
             } else if !self.results.is_empty() {
                 stroked_text(
@@ -491,13 +526,13 @@ impl eframe::App for ScanApp {
                         self.open_count(),
                         self.elapsed.as_secs_f64()
                     ),
-                    egui::Color32::from_rgb(80, 250, 123),
+                    egui::Color32::from_rgb(34, 197, 94),
                 );
             } else {
                 stroked_text(
                     ui,
                     "○ 就绪 — 输入目标后点击「开始扫描」",
-                    egui::Color32::from_rgb(170, 170, 170),
+                    egui::Color32::from_rgb(148, 163, 184),
                 );
             }
             ui.add_space(4.0);
@@ -632,19 +667,19 @@ impl eframe::App for ScanApp {
                                     stroked_text(
                                         ui,
                                         "可疑",
-                                        egui::Color32::from_rgb(251, 146, 60),
+                                        egui::Color32::from_rgb(249, 115, 22),
                                     );
                                 } else if *filtered {
                                     stroked_text(
                                         ui,
                                         "open|filtered",
-                                        egui::Color32::from_rgb(250, 204, 21),
+                                        egui::Color32::from_rgb(234, 179, 8),
                                     );
                                 } else {
                                     stroked_text(
                                         ui,
                                         "open",
-                                        egui::Color32::from_rgb(80, 250, 123),
+                                        egui::Color32::from_rgb(34, 197, 94),
                                     );
                                 }
                             });
@@ -675,19 +710,13 @@ fn state_rank(r: &ResultRow) -> u8 {
     }
 }
 
-/// 绘制带黑色描边的彩色文字（8 方向偏移绘制黑色轮廓，保证任意背景下可读）
+/// 绘制状态文字（纯色无描边；使用中等深度颜色，深浅主题下均清晰）
 fn stroked_text(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>, color: egui::Color32) {
     let font_id = egui::FontId::proportional(14.0);
     let galley = text
         .into()
         .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, font_id.clone());
     let pos = ui.cursor().min + egui::vec2(0.0, ui.spacing().item_spacing.y);
-    // 灰色描边：仅 4 个正交方向偏移（上下左右），避免对角叠加导致描边过粗
-    let stroke_color = egui::Color32::from_rgb(100, 100, 100);
-    for (dx, dy) in [(-1.0f32, 0.0f32), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
-        ui.painter()
-            .galley(pos + egui::vec2(dx, dy), galley.clone(), stroke_color);
-    }
     ui.painter().galley(pos, galley.clone(), color);
     ui.advance_cursor_after_rect(galley.rect.translate(pos.to_vec2()));
 }
