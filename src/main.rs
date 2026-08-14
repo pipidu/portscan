@@ -84,14 +84,7 @@ async fn main() -> anyhow::Result<()> {
             let latency = if r.latency_ms.is_empty() {
                 String::new()
             } else {
-                format!(
-                    " {}ms",
-                    r.latency_ms
-                        .iter()
-                        .map(|l| l.to_string())
-                        .collect::<Vec<_>>()
-                        .join("/")
-                )
+                format!(" {}ms", portscan::report::latency_display(&r.latency_ms))
             };
             match r.service {
                 Some(svc) => println!("  {}/{}  ({svc}){latency}{state}", r.port, r.proto),
@@ -161,11 +154,7 @@ async fn main() -> anyhow::Result<()> {
                 r.port.to_string(),
                 r.proto.to_string(),
                 r.service.unwrap_or("").to_string(),
-                r.latency_ms
-                    .iter()
-                    .map(|l| l.to_string())
-                    .collect::<Vec<_>>()
-                    .join("/"),
+                portscan::report::latency_display(&r.latency_ms),
                 state.to_string(),
             ])
             .with_context(|| format!("写入 CSV 失败: {}", path.display()))?;

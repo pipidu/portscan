@@ -29,8 +29,8 @@ impl Proto {
     }
 }
 
-/// 探测结果：状态 + 延迟列表（毫秒；仅 open 状态测量，空表示未测量）
-type ProbeResult = (ProbeState, Vec<u64>);
+/// 探测结果：状态 + 延迟列表（毫秒，仅 open 状态测量 3 次；失败项为 None 占位）
+type ProbeResult = (ProbeState, Vec<Option<u64>>);
 
 /// 单个探测点的结果状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,9 +53,10 @@ pub struct OpenPort {
     pub proto: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service: Option<&'static str>,
-    /// 探测延迟（毫秒，仅 open 状态测量 3 次）：TCP 为连接握手耗时，UDP 为发送到收到响应耗时
+    /// 探测延迟（毫秒，仅 open 状态测量 3 次）：TCP 为连接握手耗时，UDP 为发送到收到响应耗时；
+    /// 某次测量失败（超时/拒绝）时对应位置为 None（显示为 -），数组始终为 3 个位置
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub latency_ms: Vec<u64>,
+    pub latency_ms: Vec<Option<u64>>,
     /// true = UDP 无响应，状态为 open|filtered
     #[serde(default, skip_serializing_if = "is_false")]
     pub filtered: bool,
@@ -327,14 +328,11 @@ async fn tcp_probe(ip: IpAddr, port: u16, timeout_ms: u64) -> ProbeResult {
     if state != ProbeState::Open {
         return (state, Vec::new());
     }
-    let mut lats = Vec::with_capacity(3);
-    if let Some(l) = first_lat {
-        lats.push(l);
-    }
+    let mut lats: Vec<Option<u64>> = Vec::with_capacity(3);
+    // 第一次测量（open 状态必有值），失败项以 None 占位保持 3 个位置
+    lats.push(first_lat);
     for _ in 0..2 {
-        if let Some(l) = tcp_connect_latency(ip, port, timeout_ms).await {
-            lats.push(l);
-        }
+        lats.push(tcp_connect_latency(ip, port, timeout_ms).await);
     }
     (state, lats)
 }
@@ -349,14 +347,11 @@ async fn udp_probe(ip: IpAddr, port: u16, timeout_ms: u64) -> ProbeResult {
     if state != ProbeState::Open {
         return (state, Vec::new());
     }
-    let mut lats = Vec::with_capacity(3);
-    if let Some(l) = first_lat {
-        lats.push(l);
-    }
+    let mut lats: Vec<Option<u64>> = Vec::with_capacity(3);
+    // 第一次测量（open 状态必有值），失败项以 None 占位保持 3 个位置
+    lats.push(first_lat);
     for _ in 0..2 {
-        if let Some(l) = udp_roundtrip_latency(ip, port, timeout_ms).await {
-            lats.push(l);
-        }
+        lats.push(udp_roundtrip_latency(ip, port, timeout_ms).await);
     }
     (state, lats)
 }

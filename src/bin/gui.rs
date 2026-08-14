@@ -66,11 +66,7 @@ fn write_csv(
             r.port.to_string(),
             r.proto.to_string(),
             r.service.unwrap_or("").to_string(),
-            r.latency_ms
-                .iter()
-                .map(|l| l.to_string())
-                .collect::<Vec<_>>()
-                .join("/"),
+            portscan::report::latency_display(&r.latency_ms),
             state.to_string(),
         ])
         .map_err(|e| e.to_string())?;
@@ -110,7 +106,7 @@ fn write_html(
 }
 
 /// 结果表格行：(IP, 端口, 协议, 服务, 延迟ms, filtered, suspicious)
-type ResultRow = (IpAddr, u16, &'static str, Option<&'static str>, Vec<u64>, bool, bool);
+type ResultRow = (IpAddr, u16, &'static str, Option<&'static str>, Vec<Option<u64>>, bool, bool);
 
 /// 表格排序列
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -790,11 +786,7 @@ impl eframe::App for ScanApp {
                                 } else {
                                     format!(
                                         "{}ms",
-                                        latency
-                                            .iter()
-                                            .map(|l| l.to_string())
-                                            .collect::<Vec<_>>()
-                                            .join("/")
+                                        portscan::report::latency_display(latency)
                                     )
                                 };
                                 ui.label(text);
@@ -899,12 +891,13 @@ fn has_hostname(targets: &str) -> bool {
     })
 }
 
-/// 延迟平均值（空列表按最大值处理，排序时排最后）
-fn avg_latency(l: &[u64]) -> u64 {
-    if l.is_empty() {
+/// 延迟平均值（仅统计成功测量的值；全部失败按最大值处理，排序时排最后）
+fn avg_latency(l: &[Option<u64>]) -> u64 {
+    let values: Vec<u64> = l.iter().flatten().copied().collect();
+    if values.is_empty() {
         u64::MAX
     } else {
-        l.iter().sum::<u64>() / l.len() as u64
+        values.iter().sum::<u64>() / values.len() as u64
     }
 }
 

@@ -59,6 +59,15 @@ fn group_rows(results: &[OpenPort]) -> Vec<(&OpenPort, &'static str)> {
     rows
 }
 
+/// 延迟显示：3 个位置，测量失败（None）显示为 -
+pub fn latency_display(latency: &[Option<u64>]) -> String {
+    latency
+        .iter()
+        .map(|v| v.map_or_else(|| "-".to_string(), |x| x.to_string()))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// TXT 文本报告
 pub fn to_txt(meta: &ReportMeta, results: &[OpenPort]) -> String {
     let mut s = String::new();
@@ -75,14 +84,7 @@ pub fn to_txt(meta: &ReportMeta, results: &[OpenPort]) -> String {
         let latency = if r.latency_ms.is_empty() {
             String::new()
         } else {
-            format!(
-                " {}ms",
-                r.latency_ms
-                    .iter()
-                    .map(|l| l.to_string())
-                    .collect::<Vec<_>>()
-                    .join("/")
-            )
+            format!(" {}ms", latency_display(&r.latency_ms))
         };
         let svc = r.service.unwrap_or("");
         let _ = writeln!(
@@ -108,13 +110,12 @@ pub fn to_html(meta: &ReportMeta, results: &[OpenPort]) -> String {
     let mut s = String::new();
     s.push_str("<!DOCTYPE html>\n<html lang=\"zh\"><head><meta charset=\"utf-8\">\n");
     s.push_str("<title>portscan 扫描报告</title>\n");
-    // 配色与 GUI 深色主题一致：背景 #0f172a、文字 #e2e8f0、标题蓝 #3b82f6、
-    // 状态色 open #22c55e / 可疑 #f97316 / 过滤 #eab308 / 其他 #ef4444 / 未扫描 #4b5563
-    s.push_str("<style>body{font-family:'Microsoft YaHei',sans-serif;margin:24px;background:#0f172a;color:#e2e8f0}\n");
-    s.push_str("h1{color:#3b82f6} table{border-collapse:collapse;width:100%;margin-top:12px}\n");
-    s.push_str("th,td{border:1px solid #334155;padding:6px 10px;text-align:left}\n");
-    s.push_str("th{background:#1e293b} tr:nth-child(even){background:#16213a}\n");
-    s.push_str(".open{color:#22c55e;font-weight:bold}.susp{color:#f97316;font-weight:bold}.filt{color:#eab308;font-weight:bold}</style></head><body>\n");
+    // 白底浅色风格；状态色保持（open #22c55e / 可疑 #f97316 / 过滤 #eab308 / 其他 #ef4444）
+    s.push_str("<style>body{font-family:'Microsoft YaHei',sans-serif;margin:24px;background:#ffffff;color:#1e293b}\n");
+    s.push_str("h1{color:#2563eb} table{border-collapse:collapse;width:100%;margin-top:12px}\n");
+    s.push_str("th,td{border:1px solid #cbd5e1;padding:6px 10px;text-align:left}\n");
+    s.push_str("th{background:#f1f5f9} tr:nth-child(even){background:#f8fafc}\n");
+    s.push_str(".open{color:#16a34a;font-weight:bold}.susp{color:#ea580c;font-weight:bold}.filt{color:#ca8a04;font-weight:bold}</style></head><body>\n");
     s.push_str("<h1>portscan 扫描报告</h1>\n");
     s.push_str("<table>\n");
     for line in meta.summary_lines() {
@@ -134,7 +135,7 @@ pub fn to_html(meta: &ReportMeta, results: &[OpenPort]) -> String {
     ];
     let _ = writeln!(
         s,
-        "<div style=\"display:flex;height:18px;margin-top:12px;border:1px solid #334155\">"
+        "<div style=\"display:flex;height:18px;margin-top:12px;border:1px solid #cbd5e1\">"
     );
     for (w, color) in segs {
         if w > 0.0 {
@@ -150,12 +151,7 @@ pub fn to_html(meta: &ReportMeta, results: &[OpenPort]) -> String {
             let latency = if r.latency_ms.is_empty() {
                 String::new()
             } else {
-                r.latency_ms
-                    .iter()
-                    .map(|l| l.to_string())
-                    .collect::<Vec<_>>()
-                    .join("/")
-                    + "ms"
+                latency_display(&r.latency_ms) + "ms"
             };
             let cls = if r.suspicious {
                 "susp"
@@ -242,7 +238,7 @@ mod tests {
                 port: 80,
                 proto: "tcp",
                 service: Some("http"),
-                latency_ms: vec![2, 3, 2],
+                latency_ms: vec![Some(2), Some(3), Some(2)],
                 filtered: false,
                 suspicious: false,
             },
@@ -251,11 +247,20 @@ mod tests {
                 port: 25,
                 proto: "tcp",
                 service: Some("smtp"),
-                latency_ms: vec![],
+                latency_ms: vec![Some(101), None, Some(105)],
                 filtered: false,
                 suspicious: true,
             },
         ]
+    }
+
+    #[test]
+    fn latency_display_keeps_three_slots() {
+        // 测量失败的位置显示 -，保持 3 个位置
+        assert_eq!(latency_display(&[]), "");
+        assert_eq!(latency_display(&[Some(101), None, Some(105)]), "101/-/105");
+        assert_eq!(latency_display(&[Some(2), Some(3), Some(2)]), "2/3/2");
+        assert_eq!(latency_display(&[None, None, None]), "-/-/-");
     }
 
     #[test]
