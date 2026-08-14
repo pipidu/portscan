@@ -70,7 +70,13 @@ fn write_csv(results: &[OpenPort], path: &PathBuf) -> Result<(), String> {
     wtr.write_record(["ip", "port", "proto", "service", "state"])
         .map_err(|e| e.to_string())?;
     for r in results {
-        let state = if r.filtered { "open|filtered" } else { "open" };
+        let state = if r.suspicious {
+            "suspicious"
+        } else if r.filtered {
+            "open|filtered"
+        } else {
+            "open"
+        };
         wtr.write_record([
             r.ip.to_string(),
             r.port.to_string(),
@@ -99,6 +105,9 @@ fn write_json(results: &[OpenPort], path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
+/// 结果表格行：(IP, 端口, 协议, 服务, filtered, suspicious)
+type ResultRow = (IpAddr, u16, &'static str, Option<&'static str>, bool, bool);
+
 struct ScanApp {
     // 输入
     targets_text: String,
@@ -118,6 +127,7 @@ struct ScanApp {
     results: Vec<OpenPort>,
     // 状态过滤（表格显示）
     show_open: bool,
+    show_suspicious: bool,
     show_filtered: bool,
     // 后台任务
     progress_rx: Option<watch::Receiver<Progress>>,
@@ -143,6 +153,7 @@ impl Default for ScanApp {
             error: None,
             results: Vec::new(),
             show_open: true,
+            show_suspicious: true,
             show_filtered: true,
             progress_rx: None,
             open_rx: None,
@@ -446,14 +457,23 @@ impl eframe::App for ScanApp {
             ui.horizontal(|ui| {
                 ui.label("状态过滤:");
                 ui.checkbox(&mut self.show_open, "open");
+                ui.checkbox(&mut self.show_suspicious, "可疑");
                 ui.checkbox(&mut self.show_filtered, "open|filtered");
             });
             ui.add_space(4.0);
-            let mut rows: Vec<(IpAddr, u16, &'static str, Option<&'static str>, bool)> = self
+            let mut rows: Vec<ResultRow> = self
                 .results
                 .iter()
-                .filter(|r| (r.filtered && self.show_filtered) || (!r.filtered && self.show_open))
-                .map(|r| (r.ip, r.port, r.proto, r.service, r.filtered))
+                .filter(|r| {
+                    if r.suspicious {
+                        self.show_suspicious
+                    } else if r.filtered {
+                        self.show_filtered
+                    } else {
+                        self.show_open
+                    }
+                })
+                .map(|r| (r.ip, r.port, r.proto, r.service, r.filtered, r.suspicious))
                 .collect();
             if rows.is_empty() {
                 ui.centered_and_justified(|ui| {
@@ -483,7 +503,7 @@ impl eframe::App for ScanApp {
                     });
                 })
                 .body(|mut body| {
-                    for (ip, port, proto, svc, filtered) in &rows {
+                    for (ip, port, proto, svc, filtered, suspicious) in &rows {
                         body.row(18.0, |mut row| {
                             row.col(|ui| {
                                 ui.label(ip.to_string());
@@ -495,7 +515,12 @@ impl eframe::App for ScanApp {
                                 ui.label(svc.unwrap_or(""));
                             });
                             row.col(|ui| {
-                                if *filtered {
+                                if *suspicious {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(251, 146, 60),
+                                        egui::RichText::new("可疑").strong(),
+                                    );
+                                } else if *filtered {
                                     ui.colored_label(
                                         egui::Color32::from_rgb(250, 204, 21),
                                         egui::RichText::new("open|filtered").strong(),

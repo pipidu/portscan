@@ -75,7 +75,13 @@ async fn main() -> anyhow::Result<()> {
         port_list.sort_by_key(|r| r.port);
         println!("\n{} 开放端口 ({}):", ip, port_list.len());
         for r in port_list.iter() {
-            let state = if r.filtered { " [open|filtered]" } else { "" };
+            let state = if r.suspicious {
+                " [可疑]"
+            } else if r.filtered {
+                " [open|filtered]"
+            } else {
+                ""
+            };
             match r.service {
                 Some(svc) => println!("  {}/{}  ({svc}){state}", r.port, r.proto),
                 None => println!("  {}/{}{state}", r.port, r.proto),
@@ -84,10 +90,18 @@ async fn main() -> anyhow::Result<()> {
     }
     if !cli.quiet {
         let filtered = results.iter().filter(|r| r.filtered).count();
-        let state_note = if filtered > 0 {
-            format!("（其中 {filtered} 个为 open|filtered）")
-        } else {
+        let suspicious = results.iter().filter(|r| r.suspicious).count();
+        let mut notes = Vec::new();
+        if filtered > 0 {
+            notes.push(format!("{filtered} 个 open|filtered"));
+        }
+        if suspicious > 0 {
+            notes.push(format!("{suspicious} 个可疑（疑似劫持）"));
+        }
+        let state_note = if notes.is_empty() {
             String::new()
+        } else {
+            format!("（其中 {}）", notes.join("，"))
         };
         eprintln!(
             "\n扫描完成: {} 个探测点, 耗时 {:.2}s, 共发现 {} 个开放端口{state_note}",
@@ -103,7 +117,13 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("无法创建 CSV 文件: {}", path.display()))?;
         wtr.write_record(["ip", "port", "proto", "service", "state"])?;
         for r in &results {
-            let state = if r.filtered { "open|filtered" } else { "open" };
+            let state = if r.suspicious {
+                "suspicious"
+            } else if r.filtered {
+                "open|filtered"
+            } else {
+                "open"
+            };
             wtr.write_record([
                 r.ip.to_string(),
                 r.port.to_string(),

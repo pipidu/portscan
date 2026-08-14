@@ -38,6 +38,8 @@ pub enum ProbeState {
     Filtered,
     /// 确认关闭（TCP 拒绝 / UDP 收到 ICMP 不可达）
     Closed,
+    /// TCP 连接成功但连接建立后立即收到 RST/FIN（tcpwrapped 特征，疑似网关劫持）
+    Suspicious,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -51,6 +53,9 @@ pub struct OpenPort {
     /// true = UDP 无响应，状态为 open|filtered
     #[serde(default, skip_serializing_if = "is_false")]
     pub filtered: bool,
+    /// true = TCP 连接后立即被对端关闭（疑似劫持/tcpwrapped）
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub suspicious: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -183,6 +188,7 @@ pub async fn scan(
                                 service_name(port)
                             },
                             filtered: state == ProbeState::Filtered,
+                            suspicious: state == ProbeState::Suspicious,
                         };
                         open.lock().unwrap().push(found.clone());
                         // 实时推送：GUI 等调用方收到后立即显示，无需等待扫描结束
@@ -222,14 +228,43 @@ pub async fn scan(
     Ok(open)
 }
 
-/// TCP 探测：connect 成功即开放，否则关闭
+/// TCP 探测：connect 成功即开放，否则关闭。
+/// 连接成功后额外等待一个短窗口读取数据：
+/// - 收到数据（banner）=> Open（真实服务）
+/// - 立即收到 RST/FIN（EOF）=> Suspicious（tcpwrapped/劫持特征）
+/// - 超时无响应 => Open（真实服务可能静默等待客户端先发言，不能误判）
 async fn tcp_probe(ip: IpAddr, port: u16, timeout_ms: u64) -> ProbeState {
     let addr = SocketAddr::new(ip, port);
-    let connected = timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr)).await;
-    if connected.is_ok_and(|r| r.is_ok()) {
-        ProbeState::Open
-    } else {
-        ProbeState::Closed
+    // timeout 外层返回 Result<Result<TcpStream>, Elapsed>，需双层解包
+    let Ok(connect_result) = timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr)).await
+    else {
+        return ProbeState::Closed;
+    };
+    let Ok(stream) = connect_result else {
+        return ProbeState::Closed;
+    };
+    // 连接成功后的检测窗口：等待可读或错误
+    // - 收到数据（banner）=> Open（真实服务）
+    // - EOF（try_read 返回 0）或 RST => Suspicious（tcpwrapped/劫持特征）
+    // - 超时无响应 => Open（真实服务可能静默等待客户端先发言，不能误判）
+    let mut buf = [0u8; 256];
+    match timeout(Duration::from_millis(timeout_ms), stream.readable()).await {
+        Ok(Ok(())) => match stream.try_read(&mut buf) {
+            Ok(0) => ProbeState::Suspicious, // EOF：对端建立连接后立即关闭
+            Ok(_) => ProbeState::Open,       // 收到 banner
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                ProbeState::Suspicious // 连接后立即 RST：疑似劫持
+            }
+            // 其他错误（含 WouldBlock 竞态）：无法证明劫持，保守判 Open
+            Err(_) => ProbeState::Open,
+        },
+        // readable() 本身出错或超时：无证据判劫持，保持 Open
+        _ => ProbeState::Open,
     }
 }
 
@@ -477,6 +512,23 @@ mod tests {
             !res.iter().any(|o| o.port == closed_port && !o.filtered),
             "关闭的 UDP 端口不应被误报为开放"
         );
+    }
+
+    #[tokio::test]
+    async fn tcp_probe_detects_immediate_close() {
+        // listener accept 后立即关闭连接：客户端应判定为 Suspicious（EOF/RST 特征）
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                drop(sock); // 连接建立后立即关闭
+            }
+        });
+        let state = tcp_probe(IpAddr::from([127, 0, 0, 1]), port, 500).await;
+        assert_eq!(state, ProbeState::Suspicious);
     }
 
     #[tokio::test]
