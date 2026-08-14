@@ -342,72 +342,77 @@ impl eframe::App for ScanApp {
         // ---- 顶部输入区 ----
         egui::Panel::top("input").show(ui, |ui| {
             ui.add_space(8.0);
-            ui.heading("端口扫描工具");
+            ui.horizontal(|ui| {
+                ui.heading("端口扫描工具");
+                ui.weak("— 内网 TCP/UDP 端口扫描");
+            });
             ui.add_space(4.0);
-            egui::Grid::new("input_grid")
-                .num_columns(2)
-                .spacing([12.0, 8.0])
-                .show(ui, |ui| {
-                    ui.label("目标 (IP/域名/CIDR，逗号分隔):");
+            // 目标输入（整行，回车即开始扫描）
+            let target_edit = ui
+                .horizontal(|ui| {
+                    ui.label("目标:");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.targets_text)
                             .hint_text("例如 192.168.1.0/24, 192.168.1.10")
-                            .desired_width(440.0),
-                    );
-                    ui.end_row();
-
-                    ui.label("端口范围:");
-                    ui.horizontal(|ui| {
-                        ui.add_enabled(
-                            !self.common_ports,
-                            egui::TextEdit::singleline(&mut self.ports_text).desired_width(200.0),
-                        );
-                        ui.checkbox(&mut self.common_ports, "仅常用端口");
+                            .desired_width(520.0),
+                    )
+                })
+                .inner;
+            if target_edit.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                && !self.running
+                && !self.targets_text.trim().is_empty()
+            {
+                self.start_scan();
+            }
+            // 参数单行：端口 / 仅常用 / 协议 / 并发 / 超时
+            ui.horizontal(|ui| {
+                ui.label("端口:");
+                ui.add_enabled(
+                    !self.common_ports,
+                    egui::TextEdit::singleline(&mut self.ports_text).desired_width(150.0),
+                );
+                ui.checkbox(&mut self.common_ports, "仅常用端口");
+                ui.separator();
+                ui.label("协议:");
+                egui::ComboBox::from_id_salt("proto_combo")
+                    .selected_text(match self.proto {
+                        scanner::Proto::Tcp => "TCP",
+                        scanner::Proto::Udp => "UDP",
+                        scanner::Proto::Both => "TCP+UDP",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.proto, scanner::Proto::Tcp, "TCP");
+                        ui.selectable_value(&mut self.proto, scanner::Proto::Udp, "UDP");
+                        ui.selectable_value(&mut self.proto, scanner::Proto::Both, "TCP+UDP");
                     });
-                    ui.end_row();
-
-                    ui.label("协议:");
-                    egui::ComboBox::from_id_salt("proto_combo")
-                        .selected_text(match self.proto {
-                            scanner::Proto::Tcp => "TCP",
-                            scanner::Proto::Udp => "UDP",
-                            scanner::Proto::Both => "TCP+UDP",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.proto, scanner::Proto::Tcp, "TCP");
-                            ui.selectable_value(&mut self.proto, scanner::Proto::Udp, "UDP");
-                            ui.selectable_value(&mut self.proto, scanner::Proto::Both, "TCP+UDP");
-                        });
-                    ui.end_row();
-
-                    ui.label("并发数:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.concurrency_text)
-                            .desired_width(120.0),
-                    );
-                    ui.end_row();
-
-                    ui.label("超时 (毫秒):");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.timeout_text).desired_width(120.0),
-                    );
-                    ui.end_row();
-                });
+                ui.separator();
+                ui.label("并发:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.concurrency_text).desired_width(70.0),
+                );
+                ui.label("超时(ms):");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.timeout_text).desired_width(70.0),
+                );
+            });
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let can_start = !self.running && !self.targets_text.trim().is_empty();
-                if ui
-                    .add_enabled(can_start, egui::Button::new("▶ 开始扫描"))
-                    .clicked()
-                {
+                // 开始按钮：主色填充
+                let start_btn = egui::Button::new(egui::RichText::new("▶ 开始扫描").strong())
+                    .fill(egui::Color32::from_rgb(22, 163, 74))
+                    .stroke(egui::Stroke::NONE);
+                if ui.add_enabled(can_start, start_btn).clicked() {
                     self.start_scan();
                 }
-                if ui
-                    .add_enabled(self.running, egui::Button::new("■ 取消"))
-                    .clicked()
-                {
+                // 取消按钮：红色描边
+                let cancel_btn = egui::Button::new(egui::RichText::new("■ 取消").strong())
+                    .stroke(egui::Stroke::new(1.5, egui::Color32::from_rgb(220, 60, 60)));
+                if ui.add_enabled(self.running, cancel_btn).clicked() {
                     self.cancel_scan();
                 }
+                ui.separator();
                 let has_results = !self.results.is_empty();
                 if ui
                     .add_enabled(has_results, egui::Button::new("导出 CSV"))
@@ -421,6 +426,19 @@ impl eframe::App for ScanApp {
                 {
                     self.export_dialog("json");
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // 端口数量提示
+                    let port_count = if self.common_ports {
+                        Some(ports::COMMON_PORTS.len())
+                    } else {
+                        ports::parse_ports(&self.ports_text).ok().map(|p| p.len())
+                    };
+                    if let Some(n) = port_count {
+                        ui.weak(format!("端口数: {n}"));
+                    } else {
+                        ui.weak("端口数: —");
+                    }
+                });
             });
             ui.add_space(8.0);
         });
@@ -451,29 +469,25 @@ impl eframe::App for ScanApp {
                 stroked_text(
                     ui,
                     format!(
-                        "已耗时 {:.1}s，已发现 {} 个开放端口",
+                        "● 已耗时 {:.1}s，已发现 {} 个开放端口",
                         self.elapsed.as_secs_f64(),
                         self.open_count()
                     ),
                     egui::Color32::from_rgb(56, 189, 248),
                 );
             } else if self.canceled {
-                stroked_text(
-                    ui,
-                    "已取消",
-                    egui::Color32::from_rgb(251, 146, 60),
-                );
+                stroked_text(ui, "■ 已取消", egui::Color32::from_rgb(251, 146, 60));
             } else if let Some(err) = &self.error {
                 stroked_text(
                     ui,
-                    format!("错误: {err}"),
+                    format!("✗ 错误: {err}"),
                     egui::Color32::from_rgb(255, 85, 85),
                 );
             } else if !self.results.is_empty() {
                 stroked_text(
                     ui,
                     format!(
-                        "扫描完成，共发现 {} 个开放端口（耗时 {:.1}s）",
+                        "✓ 扫描完成，共发现 {} 个开放端口（耗时 {:.1}s）",
                         self.open_count(),
                         self.elapsed.as_secs_f64()
                     ),
@@ -482,7 +496,7 @@ impl eframe::App for ScanApp {
             } else {
                 stroked_text(
                     ui,
-                    "就绪 — 输入目标后点击「开始扫描」",
+                    "○ 就绪 — 输入目标后点击「开始扫描」",
                     egui::Color32::from_rgb(170, 170, 170),
                 );
             }
@@ -605,7 +619,13 @@ impl eframe::App for ScanApp {
                                             .join("/")
                                     )
                                 };
-                                ui.label(text);
+                                // 数值列右对齐
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(text);
+                                    },
+                                );
                             });
                             row.col(|ui| {
                                 if *suspicious {
