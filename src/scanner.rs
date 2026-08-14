@@ -267,7 +267,9 @@ async fn tcp_probe_once(ip: IpAddr, port: u16, timeout_ms: u64) -> (ProbeState, 
     };
     // 连接握手耗时即 RTT 近似
     let latency = t0.elapsed().as_millis() as u64;
-    let dur = Duration::from_millis(timeout_ms);
+    // banner/响应等待窗口：封顶 600ms，避免静默服务与劫持端口长时间占用任务拖慢扫描与实时推送
+    let wait = Duration::from_millis(timeout_ms.min(600));
+    let dur = wait;
     let payload = tcp_probe_payload(port);
     // 发送协议探测（仅 25/110/143）
     if let Some(p) = payload {
@@ -303,11 +305,15 @@ async fn tcp_probe_once(ip: IpAddr, port: u16, timeout_ms: u64) -> (ProbeState, 
     (state, Some(latency))
 }
 
-/// 仅测量连接握手耗时（不判定状态），用于 open 端口的重复延迟采样
+/// 仅测量连接握手耗时（不判定状态），用于 open 端口的重复延迟采样；短超时快速失败
 async fn tcp_connect_latency(ip: IpAddr, port: u16, timeout_ms: u64) -> Option<u64> {
     let addr = SocketAddr::new(ip, port);
     let t0 = std::time::Instant::now();
-    let Ok(Ok(_)) = timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr)).await
+    let Ok(Ok(_)) = timeout(
+        Duration::from_millis(timeout_ms.min(300)),
+        TcpStream::connect(addr),
+    )
+    .await
     else {
         return None;
     };
@@ -369,7 +375,8 @@ async fn udp_probe_once(ip: IpAddr, port: u16, timeout_ms: u64) -> (ProbeState, 
     }
     let t0 = std::time::Instant::now();
     let mut buf = [0u8; 64];
-    match timeout(Duration::from_millis(timeout_ms), socket.recv(&mut buf)).await {
+    // 响应等待窗口封顶 600ms
+    match timeout(Duration::from_millis(timeout_ms.min(600)), socket.recv(&mut buf)).await {
         Ok(Ok(_)) => (ProbeState::Open, Some(t0.elapsed().as_millis() as u64)),
         Ok(Err(e)) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::ConnectionRefused) => (ProbeState::Closed, None),
@@ -378,7 +385,7 @@ async fn udp_probe_once(ip: IpAddr, port: u16, timeout_ms: u64) -> (ProbeState, 
     }
 }
 
-/// 仅测量 UDP 发送到响应耗时，用于 open 端口的重复延迟采样
+/// 仅测量 UDP 发送到响应耗时，用于 open 端口的重复延迟采样；短超时快速失败
 async fn udp_roundtrip_latency(ip: IpAddr, port: u16, timeout_ms: u64) -> Option<u64> {
     let Ok(socket) = UdpSocket::bind((ip, 0)).await else {
         return None;
@@ -391,7 +398,7 @@ async fn udp_roundtrip_latency(ip: IpAddr, port: u16, timeout_ms: u64) -> Option
     }
     let t0 = std::time::Instant::now();
     let mut buf = [0u8; 64];
-    match timeout(Duration::from_millis(timeout_ms), socket.recv(&mut buf)).await {
+    match timeout(Duration::from_millis(timeout_ms.min(300)), socket.recv(&mut buf)).await {
         Ok(Ok(_)) => Some(t0.elapsed().as_millis() as u64),
         _ => None,
     }
