@@ -140,10 +140,10 @@ impl Default for ScanApp {
         Self {
             targets_text: String::new(),
             ports_text: "1-65535".into(),
-            concurrency_text: "1024".into(),
+            concurrency_text: "64".into(),
             timeout_text: "1000".into(),
             proto: scanner::Proto::Tcp,
-            common_ports: false,
+            common_ports: true,
             running: false,
             canceled: false,
             progress: None,
@@ -505,58 +505,60 @@ impl eframe::App for ScanApp {
         // ---- 底部状态区 ----
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.add_space(4.0);
-            // 常态进度条：绿=已扫描开放端口，红=已扫描非开放，灰=未扫描
+            // 常态进度条：绿=open，橙=可疑，黄=open|filtered，红=其他已扫描，灰=未扫描
             let (done, total) = match self.progress {
                 Some(p) if p.total > 0 => (p.done, p.total),
                 _ => (0, 0),
             };
-            let open_n = self.open_count();
+            let open_n = self
+                .results
+                .iter()
+                .filter(|r| !r.suspicious && !r.filtered)
+                .count();
+            let suspicious_n = self.results.iter().filter(|r| r.suspicious).count();
+            let filtered_n = self.results.iter().filter(|r| r.filtered).count();
             let total_w = ui.available_width();
-            let (green_w, red_w) = if total > 0 {
-                (
-                    total_w * (open_n as f32 / total as f32),
-                    total_w * (done.saturating_sub(open_n) as f32 / total as f32),
-                )
-            } else {
-                (0.0, 0.0)
+            let seg = |n: usize| -> f32 {
+                if total > 0 {
+                    total_w * (n as f32 / total as f32)
+                } else {
+                    0.0
+                }
             };
-            let gray_w = (total_w - green_w - red_w).max(0.0);
+            let green_w = seg(open_n);
+            let orange_w = seg(suspicious_n);
+            let yellow_w = seg(filtered_n);
+            let red_w = seg(done.saturating_sub(open_n + suspicious_n + filtered_n));
+            let gray_w = (total_w - green_w - orange_w - yellow_w - red_w).max(0.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 // 圆角为 0：颜色接缝处为直线
-                if green_w > 0.0 {
-                    ui.add(
-                        egui::ProgressBar::new(1.0)
-                            .fill(egui::Color32::from_rgb(34, 197, 94))
-                            .corner_radius(egui::CornerRadius::ZERO)
-                            .desired_width(green_w),
-                    );
-                }
-                if red_w > 0.0 {
-                    ui.add(
-                        egui::ProgressBar::new(1.0)
-                            .fill(egui::Color32::from_rgb(239, 68, 68))
-                            .corner_radius(egui::CornerRadius::ZERO)
-                            .desired_width(red_w),
-                    );
-                }
-                if gray_w > 0.0 {
-                    ui.add(
-                        egui::ProgressBar::new(1.0)
-                            .fill(egui::Color32::from_rgb(75, 85, 99))
-                            .corner_radius(egui::CornerRadius::ZERO)
-                            .desired_width(gray_w),
-                    );
-                }
+                let bar = |ui: &mut egui::Ui, w: f32, color: egui::Color32| {
+                    if w > 0.0 {
+                        ui.add(
+                            egui::ProgressBar::new(1.0)
+                                .fill(color)
+                                .corner_radius(egui::CornerRadius::ZERO)
+                                .desired_width(w),
+                        );
+                    }
+                };
+                bar(ui, green_w, egui::Color32::from_rgb(34, 197, 94));
+                bar(ui, orange_w, egui::Color32::from_rgb(249, 115, 22));
+                bar(ui, yellow_w, egui::Color32::from_rgb(234, 179, 8));
+                bar(ui, red_w, egui::Color32::from_rgb(239, 68, 68));
+                bar(ui, gray_w, egui::Color32::from_rgb(75, 85, 99));
             });
-            // 统计行（常态显示）
+            // 统计行（常态显示）：开放/可疑/开放|过滤 三组计数
             if self.running {
                 ui.weak(format!(
-                    "{done}/{total} ({:.1}%) · 开放 {open_n} 个",
+                    "{done}/{total} ({:.1}%) · 开放 {open_n} · 可疑 {suspicious_n} · 开放|过滤 {filtered_n}",
                     done as f32 * 100.0 / total as f32
                 ));
             } else if total > 0 {
-                ui.weak(format!("共 {total} 个探测点 · 开放 {open_n} 个"));
+                ui.weak(format!(
+                    "共 {total} 个探测点 · 开放 {open_n} · 可疑 {suspicious_n} · 开放|过滤 {filtered_n}"
+                ));
             } else {
                 ui.weak("等待扫描");
             }
