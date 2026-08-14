@@ -30,3 +30,6 @@ path = "src/bin/gui.rs"
 
 [profile.release]
 opt-level = 3
+
+[build-dependencies]
+winres = "0.1"
