@@ -82,7 +82,11 @@ fn write_csv(results: &[OpenPort], path: &PathBuf) -> Result<(), String> {
             r.port.to_string(),
             r.proto.to_string(),
             r.service.unwrap_or("").to_string(),
-            r.latency_ms.map_or(String::new(), |ms| ms.to_string()),
+            r.latency_ms
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .join("/"),
             state.to_string(),
         ])
         .map_err(|e| e.to_string())?;
@@ -107,7 +111,17 @@ fn write_json(results: &[OpenPort], path: &PathBuf) -> Result<(), String> {
 }
 
 /// 结果表格行：(IP, 端口, 协议, 服务, 延迟ms, filtered, suspicious)
-type ResultRow = (IpAddr, u16, &'static str, Option<&'static str>, Option<u64>, bool, bool);
+type ResultRow = (IpAddr, u16, &'static str, Option<&'static str>, Vec<u64>, bool, bool);
+
+/// 表格排序列
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortCol {
+    Ip,
+    Port,
+    Service,
+    Latency,
+    State,
+}
 
 struct ScanApp {
     // 输入
@@ -130,6 +144,9 @@ struct ScanApp {
     show_open: bool,
     show_suspicious: bool,
     show_filtered: bool,
+    // 表格排序
+    sort_col: SortCol,
+    sort_asc: bool,
     // 后台任务
     progress_rx: Option<watch::Receiver<Progress>>,
     open_rx: Option<mpsc::UnboundedReceiver<OpenPort>>,
@@ -156,6 +173,8 @@ impl Default for ScanApp {
             show_open: true,
             show_suspicious: false,
             show_filtered: false,
+            sort_col: SortCol::Port,
+            sort_asc: true,
             progress_rx: None,
             open_rx: None,
             event_rx: None,
@@ -268,6 +287,15 @@ impl ScanApp {
             self.progress_rx = None;
             self.open_rx = None;
             self.started_at = None;
+        }
+    }
+
+    fn toggle_sort(&mut self, col: SortCol) {
+        if self.sort_col == col {
+            self.sort_asc = !self.sort_asc;
+        } else {
+            self.sort_col = col;
+            self.sort_asc = true;
         }
     }
 
@@ -474,7 +502,17 @@ impl eframe::App for ScanApp {
                         self.show_open
                     }
                 })
-                .map(|r| (r.ip, r.port, r.proto, r.service, r.latency_ms, r.filtered, r.suspicious))
+                .map(|r| {
+                    (
+                        r.ip,
+                        r.port,
+                        r.proto,
+                        r.service,
+                        r.latency_ms.clone(),
+                        r.filtered,
+                        r.suspicious,
+                    )
+                })
                 .collect();
             if rows.is_empty() {
                 ui.centered_and_justified(|ui| {
@@ -482,30 +520,50 @@ impl eframe::App for ScanApp {
                 });
                 return;
             }
-            rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            // 按当前排序列与方向排序
+            let (sort_col, sort_asc) = (self.sort_col, self.sort_asc);
+            rows.sort_by(|a, b| {
+                let ord = match sort_col {
+                    SortCol::Ip => a.0.cmp(&b.0),
+                    SortCol::Port => a.1.cmp(&b.1),
+                    SortCol::Service => a.3.unwrap_or("").cmp(b.3.unwrap_or("")),
+                    SortCol::Latency => avg_latency(&a.4).cmp(&avg_latency(&b.4)),
+                    SortCol::State => state_rank(a).cmp(&state_rank(b)),
+                };
+                if sort_asc {
+                    ord
+                } else {
+                    ord.reverse()
+                }
+            });
+            // 表头排序按钮：箭头表示当前列与方向
+            let header_btn = |ui: &mut egui::Ui, title: &str, col: SortCol, app: &mut ScanApp| {
+                let arrow = if app.sort_col == col {
+                    if app.sort_asc {
+                        " ↑"
+                    } else {
+                        " ↓"
+                    }
+                } else {
+                    ""
+                };
+                if ui.button(format!("{title}{arrow}")).clicked() {
+                    app.toggle_sort(col);
+                }
+            };
             TableBuilder::new(ui)
                 .striped(true)
                 .column(Column::auto().at_least(150.0))
                 .column(Column::auto().at_least(80.0))
                 .column(Column::remainder().at_least(120.0))
-                .column(Column::auto().at_least(70.0))
+                .column(Column::auto().at_least(90.0))
                 .column(Column::auto().at_least(90.0))
                 .header(22.0, |mut header| {
-                    header.col(|ui| {
-                        ui.strong("IP 地址");
-                    });
-                    header.col(|ui| {
-                        ui.strong("端口");
-                    });
-                    header.col(|ui| {
-                        ui.strong("服务");
-                    });
-                    header.col(|ui| {
-                        ui.strong("延迟");
-                    });
-                    header.col(|ui| {
-                        ui.strong("状态");
-                    });
+                    header.col(|ui| header_btn(ui, "IP 地址", SortCol::Ip, self));
+                    header.col(|ui| header_btn(ui, "端口", SortCol::Port, self));
+                    header.col(|ui| header_btn(ui, "服务", SortCol::Service, self));
+                    header.col(|ui| header_btn(ui, "延迟", SortCol::Latency, self));
+                    header.col(|ui| header_btn(ui, "状态", SortCol::State, self));
                 })
                 .body(|mut body| {
                     for (ip, port, proto, svc, latency, filtered, suspicious) in &rows {
@@ -520,7 +578,19 @@ impl eframe::App for ScanApp {
                                 ui.label(svc.unwrap_or(""));
                             });
                             row.col(|ui| {
-                                ui.label(latency.map_or(String::new(), |ms| format!("{ms}ms")));
+                                let text = if latency.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(
+                                        "{}ms",
+                                        latency
+                                            .iter()
+                                            .map(|l| l.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join("/")
+                                    )
+                                };
+                                ui.label(text);
                             });
                             row.col(|ui| {
                                 if *suspicious {
@@ -544,6 +614,26 @@ impl eframe::App for ScanApp {
                     }
                 });
         });
+    }
+}
+
+/// 延迟平均值（空列表按最大值处理，排序时排最后）
+fn avg_latency(l: &[u64]) -> u64 {
+    if l.is_empty() {
+        u64::MAX
+    } else {
+        l.iter().sum::<u64>() / l.len() as u64
+    }
+}
+
+/// 状态排序权重：open < suspicious < open|filtered
+fn state_rank(r: &ResultRow) -> u8 {
+    if r.5 {
+        2
+    } else if r.6 {
+        1
+    } else {
+        0
     }
 }
 
