@@ -17,6 +17,10 @@ pub struct Cli {
     #[arg(short, long, default_value = "1-65535", value_name = "PORTS")]
     pub ports: String,
 
+    /// 只扫描常用端口（约 120 个，覆盖网络/数据库/中间件/游戏，快速出结果）
+    #[arg(long)]
+    pub common: bool,
+
     /// UDP 扫描模式（默认 TCP）。UDP 无响应端口显示为 open|filtered
     #[arg(short, long, conflicts_with = "both")]
     pub udp: bool,

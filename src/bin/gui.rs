@@ -106,6 +106,7 @@ struct ScanApp {
     concurrency_text: String,
     timeout_text: String,
     proto: scanner::Proto,
+    common_ports: bool,
     // 扫描状态
     running: bool,
     canceled: bool,
@@ -133,6 +134,7 @@ impl Default for ScanApp {
             concurrency_text: "1024".into(),
             timeout_text: "1000".into(),
             proto: scanner::Proto::Tcp,
+            common_ports: false,
             running: false,
             canceled: false,
             progress: None,
@@ -153,15 +155,19 @@ impl Default for ScanApp {
 impl ScanApp {
     fn start_scan(&mut self) {
         // 解析端口范围（同步、快速）；目标解析因涉及阻塞式 DNS，放入后台任务
-        let ports_list = match ports::parse_ports(&self.ports_text) {
-            Ok(v) if !v.is_empty() => v,
-            Ok(_) => {
-                self.error = Some("没有有效的端口".into());
-                return;
-            }
-            Err(e) => {
-                self.error = Some(format!("端口解析失败: {e:#}"));
-                return;
+        let ports_list = if self.common_ports {
+            ports::COMMON_PORTS.to_vec()
+        } else {
+            match ports::parse_ports(&self.ports_text) {
+                Ok(v) if !v.is_empty() => v,
+                Ok(_) => {
+                    self.error = Some("没有有效的端口".into());
+                    return;
+                }
+                Err(e) => {
+                    self.error = Some(format!("端口解析失败: {e:#}"));
+                    return;
+                }
             }
         };
         let concurrency: usize = match self.concurrency_text.trim().parse() {
@@ -303,9 +309,13 @@ impl eframe::App for ScanApp {
                     ui.end_row();
 
                     ui.label("端口范围:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.ports_text).desired_width(200.0),
-                    );
+                    ui.horizontal(|ui| {
+                        ui.add_enabled(
+                            !self.common_ports,
+                            egui::TextEdit::singleline(&mut self.ports_text).desired_width(200.0),
+                        );
+                        ui.checkbox(&mut self.common_ports, "仅常用端口");
+                    });
                     ui.end_row();
 
                     ui.label("协议:");

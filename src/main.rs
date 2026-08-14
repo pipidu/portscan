@@ -20,8 +20,12 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("没有有效的扫描目标");
     }
 
-    // 2. 解析端口范围（默认全端口 1-65535）
-    let ports = ports::parse_ports(&cli.ports).context("解析端口范围失败")?;
+    // 2. 解析端口范围（默认全端口 1-65535；--common 时用常用端口表）
+    let ports = if cli.common {
+        ports::COMMON_PORTS.to_vec()
+    } else {
+        ports::parse_ports(&cli.ports).context("解析端口范围失败")?
+    };
     if ports.is_empty() {
         anyhow::bail!("没有有效的端口");
     }

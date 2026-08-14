@@ -321,6 +321,20 @@ pub fn service_name(port: u16) -> Option<&'static str> {
     })
 }
 
+/// 常用端口（快速扫描）：覆盖常用网络服务、数据库/中间件、开发工具与主流游戏服务器
+pub const COMMON_PORTS: &[u16] = &[
+    // 基础网络服务
+    20, 21, 22, 23, 25, 53, 67, 68, 69, 80, 88, 110, 111, 123, 135, 137, 138, 139, 143,
+    161, 162, 389, 443, 445, 465, 514, 554, 587, 631, 636, 873, 990, 993, 995, 1080,
+    // 常用软件/中间件 + 游戏服务器
+    1194, 1433, 1521, 1723, 1812, 1883, 2049, 2082, 2083, 2086, 2087, 2095, 2096, 2181,
+    2222, 2302, 2375, 2376, 2379, 2456, 3000, 3128, 3306, 3389, 3478, 3689, 3690, 3724,
+    4369, 4899, 5000, 5060, 5432, 5555, 5672, 5900, 5984, 5985, 5986, 6379, 6443, 7001,
+    7777, 8000, 8008, 8009, 8080, 8081, 8211, 8443, 8500, 8888, 9000, 9001, 9090, 9092,
+    9200, 9300, 9418, 9999, 10000, 10999, 11211, 15672, 16261, 19132, 25565, 25575,
+    27015, 27017, 27036, 34197, 50000,
+];
+
 /// UDP 端口服务名：UDP 专属/常用服务优先，未命中回退通用表（[`service_name`]）
 pub fn service_name_udp(port: u16) -> Option<&'static str> {
     let udp_only = match port {
@@ -508,5 +522,24 @@ mod tests {
         // 未命中 UDP 表时回退通用映射
         assert_eq!(service_name_udp(22), Some("ssh"));
         assert_eq!(service_name_udp(443), Some("https"));
+    }
+
+    #[test]
+    fn common_ports_valid() {
+        // 非空、升序无重复、全部在 1-65535 内
+        assert!(!COMMON_PORTS.is_empty());
+        assert!(COMMON_PORTS.windows(2).all(|w| w[0] < w[1]), "端口应升序且无重复");
+        assert!(COMMON_PORTS.iter().all(|&p| (1..=65535).contains(&p)));
+        // 大部分常用端口有服务名（TCP 或 UDP 映射）
+        let known = COMMON_PORTS
+            .iter()
+            .filter(|&&p| service_name(p).is_some() || service_name_udp(p).is_some())
+            .count();
+        assert!(
+            known as f64 / COMMON_PORTS.len() as f64 > 0.9,
+            "常用端口服务名覆盖率应 >90%，实际 {}/{}",
+            known,
+            COMMON_PORTS.len()
+        );
     }
 }
