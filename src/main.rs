@@ -82,9 +82,12 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 ""
             };
+            let latency = r
+                .latency_ms
+                .map_or(String::new(), |ms| format!(" {ms}ms"));
             match r.service {
-                Some(svc) => println!("  {}/{}  ({svc}){state}", r.port, r.proto),
-                None => println!("  {}/{}{state}", r.port, r.proto),
+                Some(svc) => println!("  {}/{}  ({svc}){latency}{state}", r.port, r.proto),
+                None => println!("  {}/{}{latency}{state}", r.port, r.proto),
             }
         }
     }
@@ -115,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(path) = &cli.csv {
         let mut wtr = csv::Writer::from_path(path)
             .with_context(|| format!("无法创建 CSV 文件: {}", path.display()))?;
-        wtr.write_record(["ip", "port", "proto", "service", "state"])?;
+        wtr.write_record(["ip", "port", "proto", "service", "latency_ms", "state"])?;
         for r in &results {
             let state = if r.suspicious {
                 "suspicious"
@@ -129,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
                 r.port.to_string(),
                 r.proto.to_string(),
                 r.service.unwrap_or("").to_string(),
+                r.latency_ms.map_or(String::new(), |ms| ms.to_string()),
                 state.to_string(),
             ])
             .with_context(|| format!("写入 CSV 失败: {}", path.display()))?;

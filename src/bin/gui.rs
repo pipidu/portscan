@@ -67,7 +67,7 @@ async fn run_scan(
 
 fn write_csv(results: &[OpenPort], path: &PathBuf) -> Result<(), String> {
     let mut wtr = csv::Writer::from_path(path).map_err(|e| e.to_string())?;
-    wtr.write_record(["ip", "port", "proto", "service", "state"])
+    wtr.write_record(["ip", "port", "proto", "service", "latency_ms", "state"])
         .map_err(|e| e.to_string())?;
     for r in results {
         let state = if r.suspicious {
@@ -82,6 +82,7 @@ fn write_csv(results: &[OpenPort], path: &PathBuf) -> Result<(), String> {
             r.port.to_string(),
             r.proto.to_string(),
             r.service.unwrap_or("").to_string(),
+            r.latency_ms.map_or(String::new(), |ms| ms.to_string()),
             state.to_string(),
         ])
         .map_err(|e| e.to_string())?;
@@ -105,8 +106,8 @@ fn write_json(results: &[OpenPort], path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-/// 结果表格行：(IP, 端口, 协议, 服务, filtered, suspicious)
-type ResultRow = (IpAddr, u16, &'static str, Option<&'static str>, bool, bool);
+/// 结果表格行：(IP, 端口, 协议, 服务, 延迟ms, filtered, suspicious)
+type ResultRow = (IpAddr, u16, &'static str, Option<&'static str>, Option<u64>, bool, bool);
 
 struct ScanApp {
     // 输入
@@ -473,7 +474,7 @@ impl eframe::App for ScanApp {
                         self.show_open
                     }
                 })
-                .map(|r| (r.ip, r.port, r.proto, r.service, r.filtered, r.suspicious))
+                .map(|r| (r.ip, r.port, r.proto, r.service, r.latency_ms, r.filtered, r.suspicious))
                 .collect();
             if rows.is_empty() {
                 ui.centered_and_justified(|ui| {
@@ -487,6 +488,7 @@ impl eframe::App for ScanApp {
                 .column(Column::auto().at_least(150.0))
                 .column(Column::auto().at_least(80.0))
                 .column(Column::remainder().at_least(120.0))
+                .column(Column::auto().at_least(70.0))
                 .column(Column::auto().at_least(90.0))
                 .header(22.0, |mut header| {
                     header.col(|ui| {
@@ -499,11 +501,14 @@ impl eframe::App for ScanApp {
                         ui.strong("服务");
                     });
                     header.col(|ui| {
+                        ui.strong("延迟");
+                    });
+                    header.col(|ui| {
                         ui.strong("状态");
                     });
                 })
                 .body(|mut body| {
-                    for (ip, port, proto, svc, filtered, suspicious) in &rows {
+                    for (ip, port, proto, svc, latency, filtered, suspicious) in &rows {
                         body.row(18.0, |mut row| {
                             row.col(|ui| {
                                 ui.label(ip.to_string());
@@ -513,6 +518,9 @@ impl eframe::App for ScanApp {
                             });
                             row.col(|ui| {
                                 ui.label(svc.unwrap_or(""));
+                            });
+                            row.col(|ui| {
+                                ui.label(latency.map_or(String::new(), |ms| format!("{ms}ms")));
                             });
                             row.col(|ui| {
                                 if *suspicious {

@@ -29,6 +29,9 @@ impl Proto {
     }
 }
 
+/// 探测结果：状态 + 延迟（毫秒，无法测量时为 None）
+type ProbeResult = (ProbeState, Option<u64>);
+
 /// 单个探测点的结果状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeState {
@@ -50,6 +53,9 @@ pub struct OpenPort {
     pub proto: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service: Option<&'static str>,
+    /// 探测延迟（毫秒）：TCP 为连接握手耗时，UDP 为发送到收到响应耗时；无响应时为 None
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
     /// true = UDP 无响应，状态为 open|filtered
     #[serde(default, skip_serializing_if = "is_false")]
     pub filtered: bool,
@@ -167,7 +173,7 @@ pub async fn scan(
             set.spawn(async move {
                 // 信号量限流：控制同时进行的探测数
                 let _permit = sem.acquire().await.expect("信号量未关闭");
-                let probes: Vec<(&'static str, ProbeState)> = match proto {
+                let probes: Vec<(&'static str, ProbeResult)> = match proto {
                     Proto::Tcp => vec![("tcp", tcp_probe(ip, port, timeout_ms).await)],
                     Proto::Udp => vec![("udp", udp_probe(ip, port, timeout_ms).await)],
                     Proto::Both => vec![
@@ -175,7 +181,7 @@ pub async fn scan(
                         ("udp", udp_probe(ip, port, timeout_ms).await),
                     ],
                 };
-                for &(proto_name, state) in &probes {
+                for &(proto_name, (state, latency)) in &probes {
                     if state != ProbeState::Closed {
                         let found = OpenPort {
                             ip,
@@ -187,6 +193,7 @@ pub async fn scan(
                             } else {
                                 service_name(port)
                             },
+                            latency_ms: latency,
                             filtered: state == ProbeState::Filtered,
                             suspicious: state == ProbeState::Suspicious,
                         };
@@ -245,16 +252,19 @@ fn tcp_probe_payload(port: u16) -> Option<&'static [u8]> {
 ///   立即 RST/FIN 或超时无响应 => Suspicious（劫持/tcpwrapped 特征）
 /// - 其他端口：收到数据（banner）=> Open；立即 RST/FIN => Suspicious；
 ///   超时无响应 => Open（真实服务可能静默等待客户端先发言，不能误伤）
-async fn tcp_probe(ip: IpAddr, port: u16, timeout_ms: u64) -> ProbeState {
+async fn tcp_probe(ip: IpAddr, port: u16, timeout_ms: u64) -> ProbeResult {
     let addr = SocketAddr::new(ip, port);
+    let t0 = std::time::Instant::now();
     // timeout 外层返回 Result<Result<TcpStream>, Elapsed>，需双层解包
     let Ok(connect_result) = timeout(Duration::from_millis(timeout_ms), TcpStream::connect(addr)).await
     else {
-        return ProbeState::Closed;
+        return (ProbeState::Closed, None);
     };
     let Ok(stream) = connect_result else {
-        return ProbeState::Closed;
+        return (ProbeState::Closed, None);
     };
+    // 连接握手耗时即 RTT 近似
+    let latency = t0.elapsed().as_millis() as u64;
     let dur = Duration::from_millis(timeout_ms);
     let payload = tcp_probe_payload(port);
     // 发送协议探测（仅 25/110/143）
@@ -264,7 +274,7 @@ async fn tcp_probe(ip: IpAddr, port: u16, timeout_ms: u64) -> ProbeState {
         }
     }
     let mut buf = [0u8; 256];
-    match timeout(dur, stream.readable()).await {
+    let state = match timeout(dur, stream.readable()).await {
         Ok(Ok(())) => match stream.try_read(&mut buf) {
             Ok(0) => ProbeState::Suspicious, // EOF：对端建立连接后立即关闭
             Ok(_) => ProbeState::Open,       // 收到 banner 或对探测的响应
@@ -287,31 +297,36 @@ async fn tcp_probe(ip: IpAddr, port: u16, timeout_ms: u64) -> ProbeState {
                 ProbeState::Open
             }
         }
-    }
+    };
+    (state, Some(latency))
 }
 
 /// UDP 探测：发送探测包后等待响应或 ICMP 不可达。
-/// - 收到响应 => Open
+/// - 收到响应 => Open（延迟 = 发送到响应耗时）
 /// - Windows 上 ICMP Port Unreachable 表现为 ConnectionReset/ConnectionRefused 错误 => Closed
 /// - 超时无响应 => Filtered（可能开放，也可能被防火墙丢弃）
-async fn udp_probe(ip: IpAddr, port: u16, timeout_ms: u64) -> ProbeState {
+async fn udp_probe(ip: IpAddr, port: u16, timeout_ms: u64) -> ProbeResult {
     let Ok(socket) = UdpSocket::bind((ip, 0)).await else {
-        return ProbeState::Filtered;
+        return (ProbeState::Filtered, None);
     };
     if socket.connect((ip, port)).await.is_err() {
-        return ProbeState::Filtered;
+        return (ProbeState::Filtered, None);
     }
     // 发送 1 字节探测包；多数 UDP 服务收到空/短包后会响应或回 ICMP 不可达
     if socket.send(&[0u8]).await.is_err() {
-        return ProbeState::Filtered;
+        return (ProbeState::Filtered, None);
     }
+    let t0 = std::time::Instant::now();
     let mut buf = [0u8; 64];
     match timeout(Duration::from_millis(timeout_ms), socket.recv(&mut buf)).await {
-        Ok(Ok(_)) => ProbeState::Open,
+        Ok(Ok(_)) => (
+            ProbeState::Open,
+            Some(t0.elapsed().as_millis() as u64),
+        ),
         Ok(Err(e)) if matches!(e.kind(), std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionRefused) => ProbeState::Closed,
+            | std::io::ErrorKind::ConnectionRefused) => (ProbeState::Closed, None),
         // 其他错误或超时：无法确认，按 open|filtered 处理
-        _ => ProbeState::Filtered,
+        _ => (ProbeState::Filtered, None),
     }
 }
 
@@ -549,8 +564,9 @@ mod tests {
                 drop(sock); // 连接建立后立即关闭
             }
         });
-        let state = tcp_probe(IpAddr::from([127, 0, 0, 1]), port, 500).await;
+        let (state, latency) = tcp_probe(IpAddr::from([127, 0, 0, 1]), port, 500).await;
         assert_eq!(state, ProbeState::Suspicious);
+        assert!(latency.is_some(), "连接成功应测得延迟");
     }
 
     #[test]
@@ -583,7 +599,7 @@ mod tests {
             }
         });
         // 客户端仍持有连接（服务端未关闭）=> readable 超时 => 发过 probe => Suspicious
-        let state = tcp_probe(IpAddr::from([127, 0, 0, 1]), 25, 400).await;
+        let (state, _latency) = tcp_probe(IpAddr::from([127, 0, 0, 1]), 25, 400).await;
         assert_eq!(state, ProbeState::Suspicious);
     }
 
