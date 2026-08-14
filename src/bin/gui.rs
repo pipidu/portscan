@@ -22,10 +22,10 @@ fn runtime() -> &'static Runtime {
     RT.get_or_init(|| Runtime::new().expect("创建 tokio runtime 失败"))
 }
 
-/// 后台扫描任务：先在阻塞线程解析目标（DNS 解析可能阻塞数十秒，不能冻结 UI），
-/// 再执行扫描，通过 channel 回报进度与结果
+/// 后台扫描任务：直接执行扫描，通过 channel 回报进度与结果
+/// （目标 IP 由 GUI 解析：含域名时先弹窗让用户选择 IP）
 async fn run_scan(
-    targets_text: String,
+    ips: Vec<IpAddr>,
     ports_list: Vec<u16>,
     cfg: scanner::ScanConfig,
     proto: scanner::Proto,
@@ -33,35 +33,7 @@ async fn run_scan(
     open_tx: mpsc::UnboundedSender<OpenPort>,
     event_tx: mpsc::UnboundedSender<ScanEvent>,
 ) {
-    let parsed = tokio::task::spawn_blocking(move || {
-        target::expand_targets(std::slice::from_ref(&targets_text))
-    })
-    .await;
-    let ips = match parsed {
-        Ok(Ok(v)) if !v.is_empty() => v,
-        Ok(Ok(_)) => {
-            let _ = event_tx.send(ScanEvent::Finished(Err("没有有效的扫描目标".into())));
-            return;
-        }
-        Ok(Err(e)) => {
-            let _ = event_tx.send(ScanEvent::Finished(Err(format!("目标解析失败: {e:#}"))));
-            return;
-        }
-        Err(e) => {
-            let _ = event_tx.send(ScanEvent::Finished(Err(format!("目标解析任务失败: {e}"))));
-            return;
-        }
-    };
-    let res = scanner::scan(
-        &ips,
-        &ports_list,
-        &cfg,
-        true,
-        Some(progress_tx),
-        Some(open_tx),
-        proto,
-    )
-    .await;
+    let res = scanner::scan(&ips, &ports_list, &cfg, true, Some(progress_tx), Some(open_tx), proto).await;
     let _ = event_tx.send(ScanEvent::Finished(res.map_err(|e| format!("{e:#}"))));
 }
 
@@ -151,6 +123,11 @@ struct ScanApp {
     target_count: Option<usize>,
     target_count_for: String,
     target_count_rx: Option<mpsc::UnboundedReceiver<usize>>,
+    // 域名 IP 选择弹窗
+    picker_rx: Option<mpsc::UnboundedReceiver<Vec<IpAddr>>>,
+    pending_ips: Vec<IpAddr>,
+    selected_ips: Vec<bool>,
+    show_picker: bool,
     // 后台任务
     progress_rx: Option<watch::Receiver<Progress>>,
     open_rx: Option<mpsc::UnboundedReceiver<OpenPort>>,
@@ -182,6 +159,10 @@ impl Default for ScanApp {
             target_count: None,
             target_count_for: String::new(),
             target_count_rx: None,
+            picker_rx: None,
+            pending_ips: Vec::new(),
+            selected_ips: Vec::new(),
+            show_picker: false,
             progress_rx: None,
             open_rx: None,
             event_rx: None,
@@ -192,7 +173,28 @@ impl Default for ScanApp {
 
 impl ScanApp {
     fn start_scan(&mut self) {
-        // 解析端口范围（同步、快速）；目标解析因涉及阻塞式 DNS，放入后台任务
+        // 目标含域名时异步解析（DNS 可能慢），解析后弹窗让用户选择要扫描的 IP
+        if has_hostname(&self.targets_text) {
+            let (tx, rx) = mpsc::unbounded_channel();
+            self.picker_rx = Some(rx);
+            let text = self.targets_text.clone();
+            runtime().spawn_blocking(move || {
+                let ips = target::expand_targets(&[text]).unwrap_or_default();
+                let _ = tx.send(ips);
+            });
+            return;
+        }
+        // 纯 IP / CIDR：同步解析（快速，无 DNS），直接扫描
+        match target::expand_targets(std::slice::from_ref(&self.targets_text)) {
+            Ok(ips) if !ips.is_empty() => self.launch_scan(ips),
+            Ok(_) => self.error = Some("没有有效的扫描目标".into()),
+            Err(e) => self.error = Some(format!("目标解析失败: {e:#}")),
+        }
+    }
+
+    /// 以给定 IP 列表启动扫描（含输入校验与后台任务创建）
+    fn launch_scan(&mut self, ips: Vec<IpAddr>) {
+        // 解析端口范围（同步、快速）
         let ports_list = if self.common_ports {
             ports::COMMON_PORTS.to_vec()
         } else {
@@ -232,7 +234,7 @@ impl ScanApp {
         let (open_tx, open_rx) = mpsc::unbounded_channel::<OpenPort>();
         let (event_tx, event_rx) = mpsc::unbounded_channel::<ScanEvent>();
         let handle = runtime().spawn(run_scan(
-            self.targets_text.clone(),
+            ips,
             ports_list,
             cfg,
             self.proto,
@@ -287,6 +289,21 @@ impl ScanApp {
             if let Ok(n) = rx.try_recv() {
                 self.target_count = Some(n);
                 self.target_count_rx = None;
+            }
+        }
+        // 域名目标解析完成：>1 个 IP 弹窗选择，1 个直接扫描，0 个报错
+        if let Some(rx) = &mut self.picker_rx {
+            if let Ok(ips) = rx.try_recv() {
+                self.picker_rx = None;
+                if ips.is_empty() {
+                    self.error = Some("没有有效的扫描目标".into());
+                } else if ips.len() == 1 {
+                    self.launch_scan(ips);
+                } else {
+                    self.pending_ips = ips;
+                    self.selected_ips = vec![true; self.pending_ips.len()];
+                    self.show_picker = true;
+                }
             }
         }
         // 进度（watch 只保留最新值）
@@ -380,11 +397,18 @@ impl eframe::App for ScanApp {
             let target_edit = ui
                 .horizontal(|ui| {
                     ui.label("目标:");
-                    ui.add(
+                    let edit = ui.add(
                         egui::TextEdit::singleline(&mut self.targets_text)
-                            .hint_text("例如 192.168.1.0/24, 192.168.1.10")
-                            .desired_width(520.0),
-                    )
+                            .hint_text("例如 192.168.1.0/24, 192.168.1.10, router.local")
+                            .desired_width(480.0),
+                    );
+                    // 解析出的 IP 数量（域名多 IP 时提示）
+                    if let Some(n) = self.target_count {
+                        if n > 1 {
+                            ui.weak(format!("→ {n} 个 IP"));
+                        }
+                    }
+                    edit
                 })
                 .inner;
             if target_edit.lost_focus()
@@ -687,7 +711,79 @@ impl eframe::App for ScanApp {
                     }
                 });
         });
+
+        // ---- 域名 IP 选择弹窗 ----
+        if self.show_picker {
+            egui::Window::new("选择要扫描的 IP")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!(
+                        "域名解析出 {} 个 IP，请选择要扫描的目标：",
+                        self.pending_ips.len()
+                    ));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let all_selected = !self.selected_ips.contains(&false);
+                        if ui
+                            .button(if all_selected { "全不选" } else { "全选" })
+                            .clicked()
+                        {
+                            for s in &mut self.selected_ips {
+                                *s = !all_selected;
+                            }
+                        }
+                        ui.weak(format!(
+                            "已选 {}/{}",
+                            self.selected_ips.iter().filter(|s| **s).count(),
+                            self.selected_ips.len()
+                        ));
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            for (i, ip) in self.pending_ips.iter().enumerate() {
+                                ui.checkbox(&mut self.selected_ips[i], ip.to_string());
+                            }
+                        });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let selected: Vec<IpAddr> = self
+                            .pending_ips
+                            .iter()
+                            .zip(self.selected_ips.iter())
+                            .filter(|(_, &s)| s)
+                            .map(|(ip, _)| *ip)
+                            .collect();
+                        let can_go = !selected.is_empty() && !self.running;
+                        let go_btn = egui::Button::new(egui::RichText::new("开始扫描所选").strong())
+                            .fill(egui::Color32::from_rgb(22, 163, 74))
+                            .stroke(egui::Stroke::NONE);
+                        if ui.add_enabled(can_go, go_btn).clicked() {
+                            self.show_picker = false;
+                            self.pending_ips.clear();
+                            self.selected_ips.clear();
+                            self.launch_scan(selected);
+                        }
+                        if ui.button("取消").clicked() {
+                            self.show_picker = false;
+                            self.pending_ips.clear();
+                            self.selected_ips.clear();
+                        }
+                    });
+                });
+        }
     }
+}
+
+/// 目标文本是否包含域名（非 IP、非 CIDR 的片段）
+fn has_hostname(targets: &str) -> bool {
+    targets.split(',').any(|t| {
+        let t = t.trim();
+        !t.is_empty() && t.parse::<IpAddr>().is_err() && !t.contains('/')
+    })
 }
 
 /// 延迟平均值（空列表按最大值处理，排序时排最后）
