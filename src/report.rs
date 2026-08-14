@@ -103,13 +103,15 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// HTML 网页报告（内嵌样式，可直接浏览器打开）
+/// HTML 网页报告（内嵌样式，配色与 GUI 一致，可直接浏览器打开）
 pub fn to_html(meta: &ReportMeta, results: &[OpenPort]) -> String {
     let mut s = String::new();
     s.push_str("<!DOCTYPE html>\n<html lang=\"zh\"><head><meta charset=\"utf-8\">\n");
     s.push_str("<title>portscan 扫描报告</title>\n");
+    // 配色与 GUI 深色主题一致：背景 #0f172a、文字 #e2e8f0、标题蓝 #3b82f6、
+    // 状态色 open #22c55e / 可疑 #f97316 / 过滤 #eab308 / 其他 #ef4444 / 未扫描 #4b5563
     s.push_str("<style>body{font-family:'Microsoft YaHei',sans-serif;margin:24px;background:#0f172a;color:#e2e8f0}\n");
-    s.push_str("h1{color:#38bdf8} table{border-collapse:collapse;width:100%;margin-top:12px}\n");
+    s.push_str("h1{color:#3b82f6} table{border-collapse:collapse;width:100%;margin-top:12px}\n");
     s.push_str("th,td{border:1px solid #334155;padding:6px 10px;text-align:left}\n");
     s.push_str("th{background:#1e293b} tr:nth-child(even){background:#16213a}\n");
     s.push_str(".open{color:#22c55e;font-weight:bold}.susp{color:#f97316;font-weight:bold}.filt{color:#eab308;font-weight:bold}</style></head><body>\n");
@@ -120,6 +122,26 @@ pub fn to_html(meta: &ReportMeta, results: &[OpenPort]) -> String {
         let _ = writeln!(s, "<tr><th>{}</th><td>{}</td></tr>", html_escape(k.trim()), html_escape(v.trim()));
     }
     s.push_str("</table>\n");
+    // 与 GUI 相同的五段结果分布条（绿=open / 橙=可疑 / 黄=open|filtered / 红=其他；导出为完成态无未扫描）
+    let total = meta.total_probes.max(1) as f32;
+    let other = meta.total_probes as i64 - (meta.open + meta.suspicious + meta.filtered) as i64;
+    let pct = |n: i64| -> f32 { (n.max(0) as f32 / total * 100.0).min(100.0) };
+    let segs = [
+        (pct(meta.open as i64), "#22c55e"),
+        (pct(meta.suspicious as i64), "#f97316"),
+        (pct(meta.filtered as i64), "#eab308"),
+        (pct(other), "#ef4444"),
+    ];
+    let _ = writeln!(
+        s,
+        "<div style=\"display:flex;height:18px;margin-top:12px;border:1px solid #334155\">"
+    );
+    for (w, color) in segs {
+        if w > 0.0 {
+            let _ = writeln!(s, "<div style=\"background:{color};width:{w}%\"></div>");
+        }
+    }
+    s.push_str("</div>\n");
     if results.is_empty() {
         s.push_str("<p>（无开放端口）</p>\n");
     } else {
@@ -253,6 +275,9 @@ mod tests {
         assert!(html.contains("192.168.1.1"));
         assert!(html.contains("class=\"open\""));
         assert!(html.contains("class=\"susp\""));
+        // 结果分布条（与 GUI 配色一致）
+        assert!(html.contains("background:#22c55e"));
+        assert!(html.contains("background:#f97316"));
         // 转义验证
         let esc = html_escape("<a href=\"x\">&");
         assert_eq!(esc, "&lt;a href=&quot;x&quot;&gt;&amp;");

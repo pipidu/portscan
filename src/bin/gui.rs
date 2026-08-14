@@ -357,6 +357,13 @@ impl ScanApp {
             self.running = false;
             self.handle = None;
             self.event_rx = None;
+            // 进度补齐为 100%：防止最后一批 watch 值尚未被读取就关闭 channel 导致灰色残留
+            if let Some(p) = self.progress {
+                self.progress = Some(Progress {
+                    done: p.total,
+                    total: p.total,
+                });
+            }
             self.progress_rx = None;
             self.open_rx = None;
             self.started_at = None;
