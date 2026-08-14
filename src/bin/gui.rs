@@ -510,27 +510,55 @@ impl eframe::App for ScanApp {
                     Some(p) if p.total > 0 => (p.done, p.total),
                     _ => (0, 0),
                 };
-                let frac = if total > 0 {
-                    done as f32 / total as f32
+                let open_n = self.open_count();
+                // 分段进度条：绿=已扫描开放端口，红=已扫描非开放，灰=未扫描
+                let total_w = ui.available_width();
+                let (green_w, red_w) = if total > 0 {
+                    (
+                        total_w * (open_n as f32 / total as f32),
+                        total_w * (done.saturating_sub(open_n) as f32 / total as f32),
+                    )
                 } else {
-                    0.0
+                    (0.0, 0.0)
                 };
-                let text = if total > 0 {
-                    format!("{done}/{total} ({:.1}%)", frac * 100.0)
+                let gray_w = (total_w - green_w - red_w).max(0.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    if green_w > 0.0 {
+                        ui.add(
+                            egui::ProgressBar::new(1.0)
+                                .fill(egui::Color32::from_rgb(34, 197, 94))
+                                .desired_width(green_w),
+                        );
+                    }
+                    if red_w > 0.0 {
+                        ui.add(
+                            egui::ProgressBar::new(1.0)
+                                .fill(egui::Color32::from_rgb(239, 68, 68))
+                                .desired_width(red_w),
+                        );
+                    }
+                    if gray_w > 0.0 {
+                        ui.add(
+                            egui::ProgressBar::new(1.0)
+                                .fill(egui::Color32::from_rgb(75, 85, 99))
+                                .desired_width(gray_w),
+                        );
+                    }
+                });
+                if total > 0 {
+                    ui.weak(format!(
+                        "{done}/{total} ({:.1}%) · 开放 {open_n} 个",
+                        done as f32 * 100.0 / total as f32
+                    ));
                 } else {
-                    "准备中...".into()
-                };
-                ui.add(
-                    egui::ProgressBar::new(frac)
-                        .text(text)
-                        .desired_width(f32::INFINITY),
-                );
+                    ui.weak("准备中...");
+                }
                 stroked_text(
                     ui,
                     format!(
-                        "● 已耗时 {:.1}s，已发现 {} 个开放端口",
-                        self.elapsed.as_secs_f64(),
-                        self.open_count()
+                        "● 已耗时 {:.1}s",
+                        self.elapsed.as_secs_f64()
                     ),
                     egui::Color32::from_rgb(59, 130, 246),
                 );
@@ -678,13 +706,7 @@ impl eframe::App for ScanApp {
                                             .join("/")
                                     )
                                 };
-                                // 数值列右对齐
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.label(text);
-                                    },
-                                );
+                                ui.label(text);
                             });
                             row.col(|ui| {
                                 if *suspicious {
