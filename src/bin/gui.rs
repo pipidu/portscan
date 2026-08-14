@@ -37,8 +37,20 @@ async fn run_scan(
     let _ = event_tx.send(ScanEvent::Finished(res.map_err(|e| format!("{e:#}"))));
 }
 
-fn write_csv(results: &[OpenPort], path: &PathBuf) -> Result<(), String> {
-    let mut wtr = csv::Writer::from_path(path).map_err(|e| e.to_string())?;
+fn write_csv(
+    meta: &portscan::report::ReportMeta,
+    results: &[OpenPort],
+    path: &PathBuf,
+) -> Result<(), String> {
+    let mut wtr = csv::WriterBuilder::new()
+        .flexible(true)
+        .from_path(path)
+        .map_err(|e| e.to_string())?;
+    // 头部：本次扫描总情况（# 注释行）
+    for line in portscan::report::csv_meta_lines(meta) {
+        wtr.write_record([line.as_str()])
+            .map_err(|e| e.to_string())?;
+    }
     wtr.write_record(["ip", "port", "proto", "service", "latency_ms", "state"])
         .map_err(|e| e.to_string())?;
     for r in results {
@@ -67,18 +79,33 @@ fn write_csv(results: &[OpenPort], path: &PathBuf) -> Result<(), String> {
     Ok(())
 }
 
-fn write_json(results: &[OpenPort], path: &PathBuf) -> Result<(), String> {
-    #[derive(serde::Serialize)]
-    struct Report<'a> {
-        open_count: usize,
-        open_ports: &'a [OpenPort],
-    }
-    let report = Report {
-        open_count: results.len(),
-        open_ports: results,
-    };
-    let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+fn write_json(
+    meta: &portscan::report::ReportMeta,
+    results: &[OpenPort],
+    path: &PathBuf,
+) -> Result<(), String> {
+    let json = portscan::report::to_json(meta, results);
     std::fs::write(path, json).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn write_txt(
+    meta: &portscan::report::ReportMeta,
+    results: &[OpenPort],
+    path: &PathBuf,
+) -> Result<(), String> {
+    let txt = portscan::report::to_txt(meta, results);
+    std::fs::write(path, txt).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn write_html(
+    meta: &portscan::report::ReportMeta,
+    results: &[OpenPort],
+    path: &PathBuf,
+) -> Result<(), String> {
+    let html = portscan::report::to_html(meta, results);
+    std::fs::write(path, html).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -353,9 +380,36 @@ impl ScanApp {
         }
     }
 
+    /// 组装导出报告的本次扫描总情况
+    fn export_meta(&self) -> portscan::report::ReportMeta {
+        portscan::report::ReportMeta {
+            targets: self.targets_text.clone(),
+            ports: if self.common_ports {
+                format!("常用端口({})", ports::COMMON_PORTS.len())
+            } else {
+                self.ports_text.clone()
+            },
+            proto: self.proto.name().to_string(),
+            total_probes: self.progress.map(|p| p.total as u64).unwrap_or(0),
+            elapsed_ms: self.elapsed.as_millis(),
+            open: self
+                .results
+                .iter()
+                .filter(|r| !r.suspicious && !r.filtered)
+                .count(),
+            suspicious: self.results.iter().filter(|r| r.suspicious).count(),
+            filtered: self.results.iter().filter(|r| r.filtered).count(),
+        }
+    }
+
     fn export_dialog(&mut self, kind: &str) {
-        let filter = if kind == "csv" { "CSV 文件" } else { "JSON 文件" };
-        let ext = kind;
+        let (filter, ext) = match kind {
+            "csv" => ("CSV 文件", "csv"),
+            "json" => ("JSON 文件", "json"),
+            "txt" => ("TXT 文本报告", "txt"),
+            "html" => ("HTML 网页报告", "html"),
+            _ => return,
+        };
         let Some(path) = rfd::FileDialog::new()
             .add_filter(filter, &[ext])
             .set_file_name(format!("scan-result.{ext}"))
@@ -363,10 +417,13 @@ impl ScanApp {
         else {
             return;
         };
-        let res = if kind == "csv" {
-            write_csv(&self.results, &path)
-        } else {
-            write_json(&self.results, &path)
+        let meta = self.export_meta();
+        let res = match kind {
+            "csv" => write_csv(&meta, &self.results, &path),
+            "json" => write_json(&meta, &self.results, &path),
+            "txt" => write_txt(&meta, &self.results, &path),
+            "html" => write_html(&meta, &self.results, &path),
+            _ => return,
         };
         if let Err(e) = res {
             self.error = Some(format!("导出 {kind} 失败: {e}"));
@@ -479,6 +536,18 @@ impl eframe::App for ScanApp {
                 {
                     self.export_dialog("json");
                 }
+                if ui
+                    .add_enabled(has_results, egui::Button::new("导出 TXT"))
+                    .clicked()
+                {
+                    self.export_dialog("txt");
+                }
+                if ui
+                    .add_enabled(has_results, egui::Button::new("导出 HTML"))
+                    .clicked()
+                {
+                    self.export_dialog("html");
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // 探测点总数：IP 数 × 端口数（目标数异步解析，含域名时稍候）
                     let port_count = if self.common_ports {
@@ -564,9 +633,17 @@ impl eframe::App for ScanApp {
             }
             // 状态文字
             if self.running {
+                let speed = if self.elapsed.as_secs_f64() > 0.0 {
+                    done as f64 / self.elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
                 stroked_text(
                     ui,
-                    format!("● 已耗时 {:.1}s", self.elapsed.as_secs_f64()),
+                    format!(
+                        "● 已耗时 {:.1}s · 速度 {speed:.0} port/s",
+                        self.elapsed.as_secs_f64()
+                    ),
                     egui::Color32::from_rgb(59, 130, 246),
                 );
             } else if self.canceled {

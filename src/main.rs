@@ -5,7 +5,6 @@ use clap::Parser;
 use cli::Cli;
 use portscan::scanner::OpenPort;
 use portscan::{ports, scanner, target};
-use serde::Serialize;
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::time::Instant;
@@ -123,10 +122,31 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // 5. 导出 CSV
+    // 5. 导出（CSV / JSON / TXT / HTML，头部均含本次扫描总情况）
+    let meta = portscan::report::ReportMeta {
+        targets: cli.targets.join(","),
+        ports: if cli.common {
+            format!("常用端口({})", ports::COMMON_PORTS.len())
+        } else {
+            cli.ports.clone()
+        },
+        proto: proto.name().to_string(),
+        total_probes: total,
+        elapsed_ms: elapsed.as_millis(),
+        open: results.iter().filter(|r| !r.suspicious && !r.filtered).count(),
+        suspicious: results.iter().filter(|r| r.suspicious).count(),
+        filtered: results.iter().filter(|r| r.filtered).count(),
+    };
+
     if let Some(path) = &cli.csv {
-        let mut wtr = csv::Writer::from_path(path)
+        let mut wtr = csv::WriterBuilder::new()
+            .flexible(true)
+            .from_path(path)
             .with_context(|| format!("无法创建 CSV 文件: {}", path.display()))?;
+        for line in portscan::report::csv_meta_lines(&meta) {
+            wtr.write_record([line.as_str()])
+                .with_context(|| format!("写入 CSV 失败: {}", path.display()))?;
+        }
         wtr.write_record(["ip", "port", "proto", "service", "latency_ms", "state"])?;
         for r in &results {
             let state = if r.suspicious {
@@ -157,27 +177,30 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // 6. 导出 JSON
     if let Some(path) = &cli.json {
-        #[derive(Serialize)]
-        struct Report<'a> {
-            targets: &'a [String],
-            ports: &'a str,
-            duration_ms: u128,
-            open_count: usize,
-            open_ports: &'a [OpenPort],
-        }
-        let report = Report {
-            targets: &cli.targets,
-            ports: &cli.ports,
-            duration_ms: elapsed.as_millis(),
-            open_count: results.len(),
-            open_ports: &results,
-        };
-        let json = serde_json::to_string_pretty(&report)?;
-        std::fs::write(path, json).with_context(|| format!("无法写入 JSON 文件: {}", path.display()))?;
+        let json = portscan::report::to_json(&meta, &results);
+        std::fs::write(path, json)
+            .with_context(|| format!("无法写入 JSON 文件: {}", path.display()))?;
         if !cli.quiet {
             eprintln!("已导出 JSON: {}", path.display());
+        }
+    }
+
+    if let Some(path) = &cli.txt {
+        let txt = portscan::report::to_txt(&meta, &results);
+        std::fs::write(path, txt)
+            .with_context(|| format!("无法写入 TXT 文件: {}", path.display()))?;
+        if !cli.quiet {
+            eprintln!("已导出 TXT: {}", path.display());
+        }
+    }
+
+    if let Some(path) = &cli.html {
+        let html = portscan::report::to_html(&meta, &results);
+        std::fs::write(path, html)
+            .with_context(|| format!("无法写入 HTML 文件: {}", path.display()))?;
+        if !cli.quiet {
+            eprintln!("已导出 HTML: {}", path.display());
         }
     }
 

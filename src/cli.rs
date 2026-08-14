@@ -51,6 +51,14 @@ pub struct Cli {
     #[arg(long, value_name = "FILE")]
     pub json: Option<PathBuf>,
 
+    /// 导出结果为 TXT 文本报告
+    #[arg(long, value_name = "FILE")]
+    pub txt: Option<PathBuf>,
+
+    /// 导出结果为 HTML 网页报告
+    #[arg(long, value_name = "FILE")]
+    pub html: Option<PathBuf>,
+
     /// 不显示进度与统计信息
     #[arg(short, long)]
     pub quiet: bool,
